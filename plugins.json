@@ -1,0 +1,46 @@
+[
+    {
+        "iconUrl": "https://anime.nexus/favicon.ico",
+        "fileHash": "sha256-c4f6c6c3e464e03f8b33a55d0cd99bf215af6c8c19348509bf963443910754cf",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/arvietabz/MiruroProvider",
+        "fileSize": 3334,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "arvietabz"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "OVA"
+        ],
+        "version": -1,
+        "internalName": "AnimeNexusProvider",
+        "description": "Anime Nexus provider for Cloudstream",
+        "url": "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/AnimeNexusProvider.cs3",
+        "name": "AnimeNexusProvider"
+    },
+    {
+        "iconUrl": "",
+        "fileHash": "sha256-d5b7f0d6a5454e782b9a0a0657d5a3c2de069562b05db0bcc50e96eb1ee18e9d",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/arvietabz/MiruroProvider",
+        "fileSize": 48831,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "arvietabz"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "Cartoon"
+        ],
+        "version": 1,
+        "internalName": "MiruroProvider",
+        "description": "Miruro Plugin",
+        "url": "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/MiruroProvider.cs3",
+        "name": "MiruroProvider"
+    }
+]
