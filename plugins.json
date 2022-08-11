@@ -1,0 +1,66 @@
+[
+    {
+        "fileHash": "sha256-8f597ae182fd868caec26b8b78fa615dc839cc0b76772211243e3b544bf3e69e",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/arvietabz/MiruroProvider",
+        "fileSize": 29480,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "arvietabz"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie"
+        ],
+        "version": 1,
+        "internalName": "AllmangaProvider",
+        "description": "Allmanga via Anivexa Aggregator API",
+        "url": "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/AllmangaProvider.cs3",
+        "name": "AllmangaProvider"
+    },
+    {
+        "iconUrl": "https://anime.nexus/favicon.ico",
+        "fileHash": "sha256-578e476995ea74b7257da0bbdcb27c7dfe1f995804da2db393af50ff247808ae",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/arvietabz/MiruroProvider",
+        "fileSize": 17057,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "arvietabz"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "OVA"
+        ],
+        "version": -1,
+        "internalName": "AnimeNexusProvider",
+        "description": "Watch anime on Anime Nexus",
+        "url": "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/AnimeNexusProvider.cs3",
+        "name": "AnimeNexusProvider"
+    },
+    {
+        "iconUrl": "",
+        "fileHash": "sha256-2c4468a58c50ffd67b9d8ee283096bc480c47c4fcfd5d0d76f824a46b990ef71",
+        "apiVersion": 1,
+        "repositoryUrl": "https://github.com/arvietabz/MiruroProvider",
+        "fileSize": 68294,
+        "status": 1,
+        "language": "en",
+        "authors": [
+            "arvietabz"
+        ],
+        "tvTypes": [
+            "Anime",
+            "AnimeMovie",
+            "Cartoon"
+        ],
+        "version": 1,
+        "internalName": "MiruroProvider",
+        "description": "Miruro Plugin",
+        "url": "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/MiruroProvider.cs3",
+        "name": "MiruroProvider"
+    }
+]
