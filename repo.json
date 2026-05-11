@@ -1,10 +1,8 @@
-[
-  {
-    "name": "MiruroProvider",
-    "description": "My personal Miruro provider",
-    "version": 1,
-    "author": "arvietabz",
-    "url": "https://github.com/arvietabz/MiruroProvider/blob/builds/MiruroProvider.cs3?raw=true",
-    "iconUrl": "https://raw.githubusercontent.com/recloudstream/cloudstream/master/app/src/main/res/drawable/ic_launcher.png"
-  }
-]
+{
+  "name": "MiruroRepo",
+  "description": "My personal Miruro provider",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/plugins.json"
+  ]
+}
