@@ -100,7 +100,7 @@ class MiruroProvider : MainAPI() {
                 backgroundPosterUrl = media.bannerImage
                 plot                = media.description?.replace(Regex("<.*?>"), "")
                 tags                = media.genres
-                score               = media.averageScore?.let { Score(it) }
+                score               = Score.from100(media.averageScore)
             }
         } else {
             newAnimeLoadResponse(
@@ -112,7 +112,7 @@ class MiruroProvider : MainAPI() {
                 backgroundPosterUrl = media.bannerImage
                 plot                = media.description?.replace(Regex("<.*?>"), "")
                 tags                = media.genres
-                score               = media.averageScore?.let { Score(it) }
+                score               = Score.from100(media.averageScore)
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
