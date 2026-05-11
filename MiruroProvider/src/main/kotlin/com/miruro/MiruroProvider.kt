@@ -2,7 +2,6 @@ package com.miruro
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.google.gson.annotations.SerializedName
 
 class MiruroProvider : MainAPI() {
 
@@ -10,7 +9,6 @@ class MiruroProvider : MainAPI() {
     override var name = "Miruro"
     override var lang = "en"
     override val hasMainPage = true
-    override val hasSearch = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     private val anilistUrl = "https://graphql.anilist.co"
@@ -36,6 +34,7 @@ class MiruroProvider : MainAPI() {
             headers = mapOf("Content-Type" to "application/json")
         )
 
+        // CloudStream's parser maps JSON keys case-insensitively
         val results = response.parsed<AnilistSearchResponse>()
 
         return results.data.page.media.mapNotNull { media ->
@@ -54,8 +53,6 @@ class MiruroProvider : MainAPI() {
 
     // ─── LOAD ─────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        // url = https://www.miruro.tv/watch/147105
-        // we extract 147105
         val anilistId = url.trimEnd('/').split("/").last()
 
         val graphqlQuery = """
@@ -103,7 +100,7 @@ class MiruroProvider : MainAPI() {
                 backgroundPosterUrl = media.bannerImage
                 plot                = media.description?.replace(Regex("<.*?>"), "")
                 tags                = media.genres
-                rating              = media.averageScore?.times(100)
+                score               = media.averageScore
             }
         } else {
             newAnimeLoadResponse(
@@ -115,7 +112,7 @@ class MiruroProvider : MainAPI() {
                 backgroundPosterUrl = media.bannerImage
                 plot                = media.description?.replace(Regex("<.*?>"), "")
                 tags                = media.genres
-                rating              = media.averageScore?.times(100)
+                score               = media.averageScore
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
@@ -128,23 +125,16 @@ class MiruroProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return false // videos later
+        return false
     }
 
     // ─── DATA CLASSES ─────────────────────────────────────────────
-    // Search response shape:
-    // { "data": { "Page": { "media": [...] } } }
+    // CloudStream's parser is case-insensitive so "Page" in JSON
+    // maps fine to "page" in the data class, no @SerializedName needed
 
     data class AnilistSearchResponse(val data: SearchData)
-
-    data class SearchData(
-        @SerializedName("Page") val page: PageData  // capital P in JSON
-    )
-
-    data class PageData(
-        val media: List<MediaItem>  // lowercase in JSON, matches fine
-    )
-
+    data class SearchData(val page: PageData)
+    data class PageData(val media: List<MediaItem>)
     data class MediaItem(
         val id: Int,
         val title: TitleData,
@@ -152,15 +142,8 @@ class MiruroProvider : MainAPI() {
         val format: String?
     )
 
-    // Load response shape:
-    // { "data": { "Media": { ... } } }
-
     data class AnilistLoadResponse(val data: LoadData)
-
-    data class LoadData(
-        @SerializedName("Media") val media: MediaDetail  // capital M in JSON
-    )
-
+    data class LoadData(val media: MediaDetail)
     data class MediaDetail(
         val id: Int,
         val title: TitleData,
