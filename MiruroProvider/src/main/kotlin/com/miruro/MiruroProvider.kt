@@ -6,6 +6,8 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import android.util.Base64
 import java.util.zip.GZIPInputStream
 import java.io.ByteArrayInputStream
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 class MiruroProvider : MainAPI() {
 
@@ -186,7 +188,7 @@ class MiruroProvider : MainAPI() {
         // Parse episodes from kiwi provider, sub track
         val episodeData = try {
             val decoded = decodePipeResponse(pipeResponse.text)
-            decoded.parsed<PipeEpisodesResponse>()
+            parseJson<XxxResponse>(decoded)
                 .providers?.kiwi?.episodes?.sub ?: emptyList()
         } catch (ex: Exception) {
             emptyList()
@@ -273,10 +275,10 @@ class MiruroProvider : MainAPI() {
 
         val episodeList = try {
             val decoded = decodePipeResponse(pipeResponse.text)
-            decoded.parsed<PipeEpisodesResponse>()
+            parseJson<XxxResponse>(decoded)
                 .providers?.kiwi?.episodes?.sub ?: emptyList()
         } catch (ex: Exception) {
-            return false
+            emptyList<EpisodeItem>()  // ← explicitly type the emptyList
         }
 
         val episodeId = episodeList
@@ -303,28 +305,30 @@ class MiruroProvider : MainAPI() {
 
         val streams = try {
             val decoded = decodePipeResponse(sourcesResponse.text)
-            decoded.parsed<SourcesResponse>().streams ?: emptyList()
+            parseJson<XxxResponse>(decoded).streams ?: emptyList()
         } catch (ex: Exception) {
             return false
         }
 
         // Step 3: pass HLS streams to CloudStream
         streams.filter { it.type == "hls" && it.isActive == true }.forEach { stream ->
+            // NEW
             callback(
-                ExtractorLink(
+                newExtractorLink(
                     source  = name,
                     name    = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
                     url     = stream.url,
-                    referer = stream.referer ?: "$mainUrl/",
-                    quality = when (stream.quality) {
+                    type    = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = stream.referer ?: "$mainUrl/"
+                    this.quality = when (stream.quality) {
                         "1080p" -> Qualities.P1080.value
                         "720p"  -> Qualities.P720.value
                         "480p"  -> Qualities.P480.value
                         "360p"  -> Qualities.P360.value
                         else    -> Qualities.Unknown.value
-                    },
-                    isM3u8  = true
-                )
+                    }
+                }
             )
         }
 
