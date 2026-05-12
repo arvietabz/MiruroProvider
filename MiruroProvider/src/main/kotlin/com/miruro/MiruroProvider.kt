@@ -376,31 +376,45 @@ class MiruroProvider : MainAPI() {
     data class CoverData(val large: String?)
 
     // ─── DATA CLASSES: Pipe API ───────────────────────────────────
-    data class PipeEpisodesResponse(val providers: ProvidersData?)
-    data class ProvidersData(val kiwi: ProviderData?)
-    data class ProviderData(val episodes: EpisodesData?)
-    data class EpisodesData(val sub: List<EpisodeItem>?, val dub: List<EpisodeItem>?)
+    // Data classes for Pipe API responses
+    data class PipeEpisodesResponse(
+        val providers: ProvidersData? = null
+    )
+    
+    data class ProvidersData(
+        val kiwi: ProviderData? = null
+    )
+    
+    data class ProviderData(
+        val episodes: EpisodesData? = null
+    )
+    
+    data class EpisodesData(
+        val sub: List<EpisodeItem>? = null,
+        val dub: List<EpisodeItem>? = null
+    )
+    
     data class EpisodeItem(
         val id: String,
         val number: Int,
-        val title: String?,
-        val description: String?,
-        val image: String?,
-        val airDate: String?,
-        val duration: Int?,
-        val filler: Boolean?
+        val title: String? = null,
+        val description: String? = null,
+        val image: String? = null,
+        val airDate: String? = null,
+        val duration: Int? = null,
+        val filler: Boolean? = null
     )
-
+    
     data class SourcesResponse(
         val streams: List<StreamItem>? = null
     )
+    
     data class StreamItem(
         val url: String,
-        val type: String?,
-        val quality: String?,
-        val audio: String?,
-        val fansub: String?,
-        val isActive: Boolean?,
-        val referer: String?
+        val type: String? = null,
+        val quality: String? = null,
+        val audio: String? = null,
+        val fansub: String? = null,
+        val isActive: Boolean? = null,
+        val referer: String? = null
     )
-}
