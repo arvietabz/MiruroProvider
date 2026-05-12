@@ -9,15 +9,6 @@ import java.io.ByteArrayInputStream
 
 class MiruroProvider : MainAPI() {
 
-    companion object {
-        fun slugify(text: String): String {
-            return text.lowercase()
-                .replace(Regex("[^a-z0-9\\s]"), "")
-                .trim()
-                .replace(Regex("\\s+"), "-")
-        }
-    }
-
     override var mainUrl = "https://www.miruro.tv"
     override var name = "Miruro"
     override val hasMainPage = true
@@ -28,6 +19,38 @@ class MiruroProvider : MainAPI() {
     private val anilistUrl = "https://graphql.anilist.co"
     private val pipeUrl = "$mainUrl/api/secure/pipe"
     private val provider = "kiwi"
+
+    // ─── HELPER: slugify ──────────────────────────────────────────
+    private fun slugify(text: String): String {
+        return text.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), "")
+            .trim()
+            .replace(Regex("\\s+"), "-")
+    }
+
+    // ─── HELPER: BrowseMedia → SearchResponse ─────────────────────
+    // Defined as extension functions inside the class body so they
+    // have access to class members (slugify, mainUrl, newAnimeSearchResponse)
+    // without any data class needing to reference the outer class.
+    private fun BrowseMedia.toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
+        val titleStr = title.english ?: title.romaji ?: return null
+        val slug     = slugify(titleStr)
+        val watchUrl = "$mainUrl/watch/$id/$slug"
+        val tvType   = if (isMovie) TvType.AnimeMovie else TvType.Anime
+        return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
+            posterUrl = coverImage.large
+        }
+    }
+
+    // ─── HELPER: AnilistMedia → SearchResponse ────────────────────
+    private fun AnilistMedia.toSearchResult(): SearchResponse? {
+        val titleStr = title.english ?: title.romaji ?: return null
+        val slug     = slugify(titleStr)
+        val watchUrl = "$mainUrl/watch/$id/$slug"
+        return newAnimeSearchResponse(titleStr, watchUrl, TvType.Anime) {
+            posterUrl = coverImage.large
+        }
+    }
 
     // ─── HELPER: build pipe payload ───────────────────────────────
     private fun buildPipeParam(path: String, query: Map<String, Any>): String {
@@ -79,7 +102,6 @@ class MiruroProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val home: List<SearchResponse> = when (request.data) {
 
-            // ── Recently Updated: episodes airing this week ────────
             "recently_updated" -> {
                 val now     = System.currentTimeMillis() / 1000
                 val weekAgo = now - 7 * 24 * 3600
@@ -101,7 +123,6 @@ class MiruroProvider : MainAPI() {
                     .mapNotNull { it.media.toSearchResult() }
             }
 
-            // ── Trending Now: currently airing, sorted by trending ─
             "trending_now" -> {
                 val decoded = pipeGet(
                     "search/browse",
@@ -117,7 +138,6 @@ class MiruroProvider : MainAPI() {
                     .mapNotNull { it.toSearchResult() }
             }
 
-            // ── Recently Finished: ended recently, sorted trending ─
             "recently_finished" -> {
                 val sixMonthsAgo = run {
                     val cal = java.util.Calendar.getInstance()
@@ -142,7 +162,6 @@ class MiruroProvider : MainAPI() {
                     .mapNotNull { it.toSearchResult() }
             }
 
-            // ── Top Movies: best-rated anime movies ───────────────
             "top_movies" -> {
                 val offset  = (page - 1) * 20
                 val decoded = pipeGet(
@@ -412,17 +431,7 @@ class MiruroProvider : MainAPI() {
         val isAdult: Boolean?,
         val nextAiringEpisode: BrowseNextAiring?,
         val dubLanguages: List<String>?
-    ) {
-        fun toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
-            val titleStr = title.english ?: title.romaji ?: return null
-            val slug     = MiruroProvider.slugify(titleStr)
-            val watchUrl = "https://www.miruro.tv/watch/$id/$slug"
-            val tvType   = if (isMovie) TvType.AnimeMovie else TvType.Anime
-            return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
-                posterUrl = coverImage.large
-            }
-        }
-    }
+    )
 
     data class BrowseTitle(
         val native: String?,
@@ -455,16 +464,7 @@ class MiruroProvider : MainAPI() {
         val format: String?,
         val episodes: Int?,
         val status: String?
-    ) {
-        fun toSearchResult(): SearchResponse? {
-            val title = this.title.english ?: this.title.romaji ?: return null
-            val slug  = MiruroProvider.slugify(title)
-            val watchUrl = "https://www.miruro.tv/watch/${this.id}/$slug"
-            return newAnimeSearchResponse(title, watchUrl, TvType.Anime) {
-                posterUrl = this@AnilistMedia.coverImage.large
-            }
-        }
-    }
+    )
 
     data class AnilistLoadResponse(val data: LoadData)
     data class LoadData(@JsonProperty("Media") val media: MediaDetail)
