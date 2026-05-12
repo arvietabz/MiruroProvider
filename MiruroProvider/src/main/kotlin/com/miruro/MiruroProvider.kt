@@ -305,20 +305,22 @@ class MiruroProvider : MainAPI() {
 
         val streams = try {
             val decoded = decodePipeResponse(sourcesResponse.text)
-            parseJson<PipeEpisodesResponse>(decoded).streams ?: emptyList()
+            val response = parseJson<Map<String, SourcesResponse>>(decoded)
+            response["streams"]?.streams ?: emptyList()
         } catch (ex: Exception) {
-            return false
+            emptyList<StreamItem>()
         }
 
         // Step 3: pass HLS streams to CloudStream
-        streams.filter { it.type == "hls" && it.isActive == true }.forEach { stream ->
-            // NEW
+        streams.filter { stream ->
+        stream.type == "hls" && stream.isActive == true
+        }.forEach { stream ->
             callback(
                 newExtractorLink(
-                    source  = name,
-                    name    = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
-                    url     = stream.url,
-                    type    = ExtractorLinkType.M3U8
+                    source = name,
+                    name = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
+                    url = stream.url,
+                    type = ExtractorLinkType.M3U8
                 ) {
                     this.referer = stream.referer ?: "$mainUrl/"
                     this.quality = when (stream.quality) {
@@ -389,7 +391,9 @@ class MiruroProvider : MainAPI() {
         val filler: Boolean?
     )
 
-    data class SourcesResponse(val streams: List<StreamItem>?)
+    data class SourcesResponse(
+        val streams: List<StreamItem>? = null
+    )
     data class StreamItem(
         val url: String,
         val type: String?,
