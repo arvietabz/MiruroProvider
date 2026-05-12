@@ -20,6 +20,7 @@ class MiruroProvider : MainAPI() {
     private val pipeUrl = "$mainUrl/api/secure/pipe"
     private val provider = "kiwi"
 
+    // ─── HELPER: slugify ──────────────────────────────────────────
     private fun slugify(text: String): String {
         return text.lowercase()
             .replace(Regex("[^a-z0-9\\s]"), "")
@@ -27,44 +28,35 @@ class MiruroProvider : MainAPI() {
             .replace(Regex("\\s+"), "-")
     }
 
-    private fun buildPipeParam(path: String, query: Map<String, Any> = emptyMap()): String {
-        val queryStr = if (query.isEmpty()) "{}" else query.entries.joinToString(",", "{", "}") { (k, v) ->
-            if (v is String) "\"$k\":\"$v\""
-            else "\"$k\":$v"
-        }
-        val payload = """{"path":"$path","method":"GET","query":$queryStr,"body":null}"""
+    // ─── HELPER: build pipe payload ───────────────────────────────
+    private fun buildPipeParam(path: String, query: Map<String, Any>): String {
+        val payload = """{"path":"$path","method":"GET","query":${
+            query.entries.joinToString(",", "{", "}") { (k, v) ->
+                when (v) {
+                    is String  -> "\"$k\":\"$v\""
+                    is Boolean -> "\"$k\":$v"
+                    is List<*> -> "\"$k\":${v.joinToString(",", "[", "]") { "\"$it\"" }}"
+                    else       -> "\"$k\":$v"
+                }
+            }
+        },"body":null}"""
         return Base64.encodeToString(
             payload.toByteArray(),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
     }
 
-    // Catalog endpoints (trending/recent/popular/upcoming) return plain JSON.
-    // Episode/source endpoints return gzip-compressed base64.
-    // Try decode+decompress first; fall back to raw text if that fails.
+    // ─── HELPER: decode pipe response ─────────────────────────────
     private fun decodePipeResponse(text: String): String {
-        return try {
-            val bytes = Base64.decode(text, Base64.URL_SAFE or Base64.NO_PADDING)
-            GZIPInputStream(ByteArrayInputStream(bytes))
-                .bufferedReader()
-                .readText()
-        } catch (ex: Exception) {
-            text
-        }
+        val bytes = Base64.decode(text, Base64.URL_SAFE)
+        return GZIPInputStream(ByteArrayInputStream(bytes))
+            .bufferedReader()
+            .readText()
     }
 
-    override val mainPage = mainPageOf(
-        "recent"   to "Newest",
-        "popular"  to "Popular This Season",
-        "trending" to "Trending Now",
-        "upcoming" to "Upcoming"
-    )
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val e = buildPipeParam(
-            path  = request.data,
-            query = mapOf("page" to page, "perPage" to 20)
-        )
+    // ─── HELPER: pipe GET request ─────────────────────────────────
+    private suspend fun pipeGet(path: String, query: Map<String, Any>): String {
+        val e = buildPipeParam(path, query)
         val response = app.get(
             "$pipeUrl?e=$e",
             headers = mapOf(
@@ -72,31 +64,120 @@ class MiruroProvider : MainAPI() {
                 "Origin"  to mainUrl
             )
         )
+        return decodePipeResponse(response.text)
+    }
 
-        val decoded = decodePipeResponse(response.text)
-        val results = AppUtils.parseJson<CatalogResponse>(decoded).results ?: emptyList()
-        val home = results.mapNotNull { it.toSearchResult() }
+    // ─── MAIN PAGE ────────────────────────────────────────────────
+    // All sections use Miruro's own pipe API — only shows anime
+    // that is actually available on Miruro.
+    //
+    // Sections:
+    //   "recently_updated" → schedule endpoint (airing this week)
+    //   "trending_now"     → search/browse RELEASING TRENDING_DESC
+    //   "recently_finished"→ search/browse FINISHED TRENDING_DESC
+    //   "top_movies"       → search MOVIE SCORE_DESC
+    override val mainPage = mainPageOf(
+        "recently_updated"  to "Recently Updated",
+        "trending_now"      to "Trending Now",
+        "recently_finished" to "Recently Finished",
+        "top_movies"        to "Top Movies"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val home: List<SearchResponse> = when (request.data) {
+
+            // ── Recently Updated: episodes airing this week ────────
+            "recently_updated" -> {
+                val now      = System.currentTimeMillis() / 1000
+                val weekAgo  = now - 7 * 24 * 3600
+                val weekEnd  = now + 7 * 24 * 3600
+                // Round to day boundaries (Miruro uses midnight UTC)
+                val startAt  = (weekAgo / 86400) * 86400
+                val endAt    = (weekEnd / 86400) * 86400
+
+                val decoded = pipeGet(
+                    "schedule",
+                    mapOf(
+                        "startAt" to startAt,
+                        "endAt"   to endAt,
+                        "sort"    to listOf("TIME_DESC")
+                    )
+                )
+                val items = AppUtils.parseJson<List<ScheduleItem>>(decoded)
+                // Deduplicate by media id (multiple episodes may air)
+                items
+                    .distinctBy { it.media.id }
+                    .mapNotNull { it.media.toSearchResult() }
+            }
+
+            // ── Trending Now: currently airing, sorted by trending ─
+            "trending_now" -> {
+                val decoded = pipeGet(
+                    "search/browse",
+                    mapOf(
+                        "type"    to "ANIME",
+                        "status"  to "RELEASING",
+                        "sort"    to "TRENDING_DESC",
+                        "page"    to page,
+                        "perPage" to 20
+                    )
+                )
+                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                    .mapNotNull { it.toSearchResult() }
+            }
+
+            // ── Recently Finished: ended recently, sorted trending ─
+            "recently_finished" -> {
+                // endDate_greater: YYYYMMDD format, 6 months ago
+                val sixMonthsAgo = run {
+                    val cal = java.util.Calendar.getInstance()
+                    cal.add(java.util.Calendar.MONTH, -6)
+                    val y = cal.get(java.util.Calendar.YEAR)
+                    val m = cal.get(java.util.Calendar.MONTH) + 1
+                    val d = cal.get(java.util.Calendar.DAY_OF_MONTH)
+                    y * 10000 + m * 100 + d
+                }
+                val decoded = pipeGet(
+                    "search/browse",
+                    mapOf(
+                        "type"             to "ANIME",
+                        "status"           to "FINISHED",
+                        "sort"             to "TRENDING_DESC",
+                        "endDate_greater"  to sixMonthsAgo,
+                        "page"             to page,
+                        "perPage"          to 20
+                    )
+                )
+                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                    .mapNotNull { it.toSearchResult() }
+            }
+
+            // ── Top Movies: best-rated anime movies ───────────────
+            "top_movies" -> {
+                val offset  = (page - 1) * 20
+                val decoded = pipeGet(
+                    "search",
+                    mapOf(
+                        "format" to "MOVIE",
+                        "sort"   to "SCORE_DESC",
+                        "limit"  to 20,
+                        "offset" to offset
+                    )
+                )
+                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                    .mapNotNull { it.toSearchResult(isMovie = true) }
+            }
+
+            else -> emptyList()
+        }
 
         return newHomePageResponse(
-            list = HomePageList(
-                name               = request.name,
-                list               = home,
-                isHorizontalImages = false
-            ),
+            list    = HomePageList(name = request.name, list = home, isHorizontalImages = false),
             hasNext = true
         )
     }
 
-    private fun CatalogItem.toSearchResult(): SearchResponse? {
-        val titleStr = this.title?.english ?: this.title?.romaji ?: return null
-        val slug     = slugify(this.title?.romaji ?: titleStr)
-        val watchUrl = "$mainUrl/watch/${this.id}/$slug"
-        return newAnimeSearchResponse(titleStr, watchUrl, TvType.Anime) {
-            posterUrl = this@toSearchResult.coverImage?.large
-                ?: this@toSearchResult.coverImage?.medium
-        }
-    }
-
+    // ─── SEARCH ───────────────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse> {
         val graphqlQuery = """
             query {
@@ -121,16 +202,10 @@ class MiruroProvider : MainAPI() {
 
         return AppUtils.parseJson<AnilistSearchResponse>(response.text)
             .data.page.media
-            .mapNotNull { media ->
-                val title    = media.title.english ?: media.title.romaji ?: return@mapNotNull null
-                val slug     = slugify(media.title.romaji ?: title)
-                val watchUrl = "$mainUrl/watch/${media.id}/$slug"
-                newAnimeSearchResponse(title, watchUrl, TvType.Anime) {
-                    posterUrl = media.coverImage.large
-                }
-            }
+            .mapNotNull { it.toSearchResult() }
     }
 
+    // ─── LOAD ─────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         val anilistId = url.split("/")[4].toInt()
 
@@ -239,6 +314,7 @@ class MiruroProvider : MainAPI() {
         }
     }
 
+    // ─── LOAD LINKS ───────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -321,29 +397,67 @@ class MiruroProvider : MainAPI() {
         return true
     }
 
-    // Data classes: Pipe catalog
-    data class CatalogResponse(
-        val page: Int?,
-        val perPage: Int?,
-        val total: Int?,
-        val hasNextPage: Boolean?,
-        val results: List<CatalogItem>?
+    // ─── DATA CLASSES: Schedule API ───────────────────────────────
+    data class ScheduleItem(
+        val episode: Int,
+        val airingAt: Long,
+        val timeUntilAiring: Long,
+        val media: BrowseMedia
     )
-    data class CatalogItem(
+
+    // ─── DATA CLASSES: Browse/Search API ─────────────────────────
+    data class BrowseMedia(
         val id: Int,
-        val title: CatalogTitle?,
-        val coverImage: CatalogCover?,
+        val idMal: Int?,
+        val title: BrowseTitle,
+        val coverImage: BrowseCoverImage,
+        val bannerImage: String?,
         val format: String?,
         val status: String?,
         val episodes: Int?,
         val averageScore: Int?,
-        val season: String?,
-        val seasonYear: Int?
-    )
-    data class CatalogTitle(val romaji: String?, val english: String?, val native: String?)
-    data class CatalogCover(val large: String?, val medium: String?)
+        val popularity: Int?,
+        val genres: List<String>?,
+        val type: String?,
+        val isAdult: Boolean?,
+        val nextAiringEpisode: BrowseNextAiring?,
+        val dubLanguages: List<String>?
+    ) {
+        fun toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
+            val titleStr = title.english ?: title.romaji ?: return null
+            val slug     = titleStr.lowercase()
+                .replace(Regex("[^a-z0-9\\s]"), "")
+                .trim()
+                .replace(Regex("\\s+"), "-")
+            val watchUrl = "https://www.miruro.tv/watch/$id/$slug"
+            val tvType   = if (isMovie) TvType.AnimeMovie else TvType.Anime
+            return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
+                posterUrl = coverImage.large
+            }
+        }
+    }
 
-    // Data classes: AniList
+    data class BrowseTitle(
+        val native: String?,
+        val romaji: String?,
+        val english: String?,
+        val userPreferred: String?
+    )
+
+    data class BrowseCoverImage(
+        val color: String?,
+        val large: String?,
+        val medium: String?,
+        val extraLarge: String?
+    )
+
+    data class BrowseNextAiring(
+        val episode: Int?,
+        val airingAt: Long?,
+        val timeUntilAiring: Long?
+    )
+
+    // ─── DATA CLASSES: AniList (search + load) ───────────────────
     data class AnilistSearchResponse(val data: SearchData)
     data class SearchData(@JsonProperty("Page") val page: PageData)
     data class PageData(val media: List<AnilistMedia>)
@@ -354,7 +468,19 @@ class MiruroProvider : MainAPI() {
         val format: String?,
         val episodes: Int?,
         val status: String?
-    )
+    ) {
+        fun toSearchResult(): SearchResponse? {
+            val title = this.title.english ?: this.title.romaji ?: return null
+            val slug  = title.lowercase()
+                .replace(Regex("[^a-z0-9\\s]"), "")
+                .trim()
+                .replace(Regex("\\s+"), "-")
+            val watchUrl = "https://www.miruro.tv/watch/${this.id}/$slug"
+            return newAnimeSearchResponse(title, watchUrl, TvType.Anime) {
+                posterUrl = this@AnilistMedia.coverImage.large
+            }
+        }
+    }
 
     data class AnilistLoadResponse(val data: LoadData)
     data class LoadData(@JsonProperty("Media") val media: MediaDetail)
@@ -381,7 +507,7 @@ class MiruroProvider : MainAPI() {
     data class TitleData(val romaji: String?, val english: String?)
     data class CoverData(val large: String?)
 
-    // Data classes: Pipe episodes/sources
+    // ─── DATA CLASSES: Pipe API ───────────────────────────────────
     data class PipeEpisodesResponse(val providers: ProvidersData?)
     data class ProvidersData(val kiwi: ProviderData?)
     data class ProviderData(val episodes: EpisodesData?)
