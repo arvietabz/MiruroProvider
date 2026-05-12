@@ -6,8 +6,6 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import android.util.Base64
 import java.util.zip.GZIPInputStream
 import java.io.ByteArrayInputStream
-import com.lagradost.cloudstream3.app
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 class MiruroProvider : MainAPI() {
 
@@ -31,7 +29,6 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── HELPER: build pipe payload ───────────────────────────────
-    // Encodes a JSON payload to base64 for the pipe API
     private fun buildPipeParam(path: String, query: Map<String, Any>): String {
         val payload = """{"path":"$path","method":"GET","query":${
             query.entries.joinToString(",", "{", "}") { (k, v) ->
@@ -83,7 +80,7 @@ class MiruroProvider : MainAPI() {
             headers = mapOf("Content-Type" to "application/json")
         )
 
-        val mediaList = response.parsed<AnilistSearchResponse>().data.page.media
+        val mediaList = AppUtils.parseJson<AnilistSearchResponse>(response.text).data.page.media
         val home = mediaList.mapNotNull { it.toSearchResult() }
 
         return newHomePageResponse(
@@ -129,14 +126,13 @@ class MiruroProvider : MainAPI() {
             headers = mapOf("Content-Type" to "application/json")
         )
 
-        return response.parsed<AnilistSearchResponse>()
+        return AppUtils.parseJson<AnilistSearchResponse>(response.text)
             .data.page.media
             .mapNotNull { it.toSearchResult() }
     }
 
     // ─── LOAD ─────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        // url = https://www.miruro.tv/watch/147105/witch-hat-atelier
         val anilistId = url.split("/")[4].toInt()
 
         // ── Fetch AniList metadata ──
@@ -166,7 +162,7 @@ class MiruroProvider : MainAPI() {
             json    = mapOf("query" to graphqlQuery),
             headers = mapOf("Content-Type" to "application/json")
         )
-        val media   = anilistResponse.parsed<AnilistLoadResponse>().data.media
+        val media   = AppUtils.parseJson<AnilistLoadResponse>(anilistResponse.text).data.media
         val title   = media.title.english ?: media.title.romaji ?: "Unknown"
         val isMovie = media.format == "MOVIE"
         val plot    = media.description?.replace(Regex("<.*?>"), "")
@@ -185,18 +181,16 @@ class MiruroProvider : MainAPI() {
             )
         )
 
-        // Parse episodes from kiwi provider, sub track
-        val episodeData = try {
+        val episodeData: List<EpisodeItem> = try {
             val decoded = decodePipeResponse(pipeResponse.text)
-            parseJson<PipeEpisodesResponse>(decoded)
+            AppUtils.parseJson<PipeEpisodesResponse>(decoded)
                 .providers?.kiwi?.episodes?.sub ?: emptyList()
         } catch (ex: Exception) {
             emptyList()
         }
 
-        // Build episode list — use real data if available, fallback to numbered
         val episodes = if (episodeData.isNotEmpty()) {
-            episodeData.map { ep ->
+            episodeData.map { ep: EpisodeItem ->
                 newEpisode("$mainUrl/watch/$anilistId/$slug?ep=${ep.number}") {
                     this.episode     = ep.number
                     this.name        = ep.title
@@ -205,7 +199,6 @@ class MiruroProvider : MainAPI() {
                 }
             }
         } else {
-            // Fallback: numbered episodes only
             val episodeCount = when {
                 media.status == "RELEASING" && media.nextAiringEpisode?.episode != null ->
                     (media.nextAiringEpisode.episode ?: 1) - 1
@@ -256,7 +249,6 @@ class MiruroProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = https://www.miruro.tv/watch/147105/witch-hat-atelier?ep=1
         val anilistId = data.split("/")[4].toInt()
         val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
 
@@ -273,16 +265,16 @@ class MiruroProvider : MainAPI() {
             )
         )
 
-        val episodeList = try {
+        val episodeList: List<EpisodeItem> = try {
             val decoded = decodePipeResponse(pipeResponse.text)
-            parseJson<PipeEpisodesResponse>(decoded)
+            AppUtils.parseJson<PipeEpisodesResponse>(decoded)
                 .providers?.kiwi?.episodes?.sub ?: emptyList()
         } catch (ex: Exception) {
-            emptyList<EpisodeItem>()  // ← explicitly type the emptyList
+            return false
         }
 
         val episodeId = episodeList
-            .firstOrNull { it.number == epNum }
+            .firstOrNull { ep: EpisodeItem -> ep.number == epNum }
             ?.id ?: return false
 
         // Step 2: get video sources using episodeId
@@ -303,24 +295,23 @@ class MiruroProvider : MainAPI() {
             )
         )
 
-        val streams = try {
+        val streams: List<StreamItem> = try {
             val decoded = decodePipeResponse(sourcesResponse.text)
-            val response = parseJson<Map<String, SourcesResponse>>(decoded)
-            response["streams"]?.streams ?: emptyList()
+            AppUtils.parseJson<SourcesResponse>(decoded).streams ?: emptyList()
         } catch (ex: Exception) {
-            emptyList<StreamItem>()
+            return false
         }
 
         // Step 3: pass HLS streams to CloudStream
-        streams.filter { stream ->
-        stream.type == "hls" && stream.isActive == true
-        }.forEach { stream ->
+        streams.filter { stream: StreamItem ->
+            stream.type == "hls" && stream.isActive == true
+        }.forEach { stream: StreamItem ->
             callback(
                 newExtractorLink(
-                    source = name,
-                    name = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
-                    url = stream.url,
-                    type = ExtractorLinkType.M3U8
+                    source  = name,
+                    name    = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
+                    url     = stream.url,
+                    type    = ExtractorLinkType.M3U8
                 ) {
                     this.referer = stream.referer ?: "$mainUrl/"
                     this.quality = when (stream.quality) {
@@ -376,45 +367,29 @@ class MiruroProvider : MainAPI() {
     data class CoverData(val large: String?)
 
     // ─── DATA CLASSES: Pipe API ───────────────────────────────────
-    // Data classes for Pipe API responses
-    data class PipeEpisodesResponse(
-        val providers: ProvidersData? = null
-    )
-    
-    data class ProvidersData(
-        val kiwi: ProviderData? = null
-    )
-    
-    data class ProviderData(
-        val episodes: EpisodesData? = null
-    )
-    
-    data class EpisodesData(
-        val sub: List<EpisodeItem>? = null,
-        val dub: List<EpisodeItem>? = null
-    )
-    
+    data class PipeEpisodesResponse(val providers: ProvidersData?)
+    data class ProvidersData(val kiwi: ProviderData?)
+    data class ProviderData(val episodes: EpisodesData?)
+    data class EpisodesData(val sub: List<EpisodeItem>?, val dub: List<EpisodeItem>?)
     data class EpisodeItem(
         val id: String,
         val number: Int,
-        val title: String? = null,
-        val description: String? = null,
-        val image: String? = null,
-        val airDate: String? = null,
-        val duration: Int? = null,
-        val filler: Boolean? = null
+        val title: String?,
+        val description: String?,
+        val image: String?,
+        val airDate: String?,
+        val duration: Int?,
+        val filler: Boolean?
     )
-    
-    data class SourcesResponse(
-        val streams: List<StreamItem>? = null
-    )
-    
+
+    data class SourcesResponse(val streams: List<StreamItem>?)
     data class StreamItem(
         val url: String,
-        val type: String? = null,
-        val quality: String? = null,
-        val audio: String? = null,
-        val fansub: String? = null,
-        val isActive: Boolean? = null,
-        val referer: String? = null
+        val type: String?,
+        val quality: String?,
+        val audio: String?,
+        val fansub: String?,
+        val isActive: Boolean?,
+        val referer: String?
     )
+}
