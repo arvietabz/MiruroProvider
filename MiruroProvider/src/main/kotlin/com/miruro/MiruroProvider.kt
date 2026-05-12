@@ -20,7 +20,6 @@ class MiruroProvider : MainAPI() {
     private val pipeUrl = "$mainUrl/api/secure/pipe"
     private val provider = "kiwi"
 
-    // ─── HELPER: slugify ──────────────────────────────────────────
     private fun slugify(text: String): String {
         return text.lowercase()
             .replace(Regex("[^a-z0-9\\s]"), "")
@@ -28,7 +27,6 @@ class MiruroProvider : MainAPI() {
             .replace(Regex("\\s+"), "-")
     }
 
-    // ─── HELPER: build pipe payload ───────────────────────────────
     private fun buildPipeParam(path: String, query: Map<String, Any> = emptyMap()): String {
         val queryStr = if (query.isEmpty()) "{}" else query.entries.joinToString(",", "{", "}") { (k, v) ->
             if (v is String) "\"$k\":\"$v\""
@@ -41,21 +39,20 @@ class MiruroProvider : MainAPI() {
         )
     }
 
-    // ─── HELPER: decode pipe response ─────────────────────────────
+    // Catalog endpoints (trending/recent/popular/upcoming) return plain JSON.
+    // Episode/source endpoints return gzip-compressed base64.
+    // Try decode+decompress first; fall back to raw text if that fails.
     private fun decodePipeResponse(text: String): String {
-        val bytes = Base64.decode(text, Base64.URL_SAFE)
-        return GZIPInputStream(ByteArrayInputStream(bytes))
-            .bufferedReader()
-            .readText()
+        return try {
+            val bytes = Base64.decode(text, Base64.URL_SAFE or Base64.NO_PADDING)
+            GZIPInputStream(ByteArrayInputStream(bytes))
+                .bufferedReader()
+                .readText()
+        } catch (ex: Exception) {
+            text
+        }
     }
 
-    // ─── MAIN PAGE ────────────────────────────────────────────────
-    // All four categories use Miruro's own pipe catalog endpoints.
-    // These return ONLY anime that Miruro actually supports — no filtering needed.
-    //   "recent"   → currently airing this season (Newest)
-    //   "popular"  → most popular (Popular This Season)
-    //   "trending" → currently trending (Trending Now)
-    //   "upcoming" → top rated / upcoming (Top Rated)
     override val mainPage = mainPageOf(
         "recent"   to "Newest",
         "popular"  to "Popular This Season",
@@ -90,7 +87,6 @@ class MiruroProvider : MainAPI() {
         )
     }
 
-    // ─── HELPER: catalog item to search card ──────────────────────
     private fun CatalogItem.toSearchResult(): SearchResponse? {
         val titleStr = this.title?.english ?: this.title?.romaji ?: return null
         val slug     = slugify(this.title?.romaji ?: titleStr)
@@ -101,10 +97,7 @@ class MiruroProvider : MainAPI() {
         }
     }
 
-    // ─── SEARCH ───────────────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse> {
-        // Search still uses AniList since the pipe search returns the same
-        // AniList data and we want broad results here
         val graphqlQuery = """
             query {
               Page(perPage: 20) {
@@ -138,7 +131,6 @@ class MiruroProvider : MainAPI() {
             }
     }
 
-    // ─── LOAD ─────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
         val anilistId = url.split("/")[4].toInt()
 
@@ -247,7 +239,6 @@ class MiruroProvider : MainAPI() {
         }
     }
 
-    // ─── LOAD LINKS ───────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -330,8 +321,7 @@ class MiruroProvider : MainAPI() {
         return true
     }
 
-    // ─── DATA CLASSES: Pipe Catalog ───────────────────────────────
-    // Response shape from pipe catalog endpoints (trending, popular, recent, upcoming)
+    // Data classes: Pipe catalog
     data class CatalogResponse(
         val page: Int?,
         val perPage: Int?,
@@ -353,7 +343,7 @@ class MiruroProvider : MainAPI() {
     data class CatalogTitle(val romaji: String?, val english: String?, val native: String?)
     data class CatalogCover(val large: String?, val medium: String?)
 
-    // ─── DATA CLASSES: AniList ────────────────────────────────────
+    // Data classes: AniList
     data class AnilistSearchResponse(val data: SearchData)
     data class SearchData(@JsonProperty("Page") val page: PageData)
     data class PageData(val media: List<AnilistMedia>)
@@ -391,7 +381,7 @@ class MiruroProvider : MainAPI() {
     data class TitleData(val romaji: String?, val english: String?)
     data class CoverData(val large: String?)
 
-    // ─── DATA CLASSES: Pipe API ───────────────────────────────────
+    // Data classes: Pipe episodes/sources
     data class PipeEpisodesResponse(val providers: ProvidersData?)
     data class ProvidersData(val kiwi: ProviderData?)
     data class ProviderData(val episodes: EpisodesData?)
