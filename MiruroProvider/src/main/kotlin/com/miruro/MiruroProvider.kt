@@ -93,7 +93,7 @@ class MiruroProvider : MainAPI() {
     // ─── HELPER: catalog item to search card ──────────────────────
     private fun CatalogItem.toSearchResult(): SearchResponse? {
         val titleStr = this.title?.english ?: this.title?.romaji ?: return null
-        val slug     = slugify(this.title.romaji ?: titleStr)
+        val slug     = slugify(this.title?.romaji ?: titleStr)
         val watchUrl = "$mainUrl/watch/${this.id}/$slug"
         return newAnimeSearchResponse(titleStr, watchUrl, TvType.Anime) {
             posterUrl = this@toSearchResult.coverImage?.large
