@@ -135,7 +135,6 @@ class MiruroProvider : MainAPI() {
     override suspend fun load(url: String): LoadResponse {
         val anilistId = url.split("/")[4].toInt()
 
-        // ── Fetch AniList metadata ──
         val graphqlQuery = """
             query {
               Media(id: $anilistId, type: ANIME) {
@@ -168,7 +167,6 @@ class MiruroProvider : MainAPI() {
         val plot    = media.description?.replace(Regex("<.*?>"), "")
         val slug    = slugify(media.title.romaji ?: title)
 
-        // ── Fetch real episode data from Miruro pipe API ──
         val e = buildPipeParam(
             path  = "episodes",
             query = mapOf("anilistId" to anilistId, "provider" to provider)
@@ -252,7 +250,6 @@ class MiruroProvider : MainAPI() {
         val anilistId = data.split("/")[4].toInt()
         val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
 
-        // Step 1: get episode list to find the episodeId for this ep number
         val e = buildPipeParam(
             path  = "episodes",
             query = mapOf("anilistId" to anilistId, "provider" to provider)
@@ -277,7 +274,6 @@ class MiruroProvider : MainAPI() {
             .firstOrNull { ep: EpisodeItem -> ep.number == epNum }
             ?.id ?: return false
 
-        // Step 2: get video sources using episodeId
         val sourcesE = buildPipeParam(
             path  = "sources",
             query = mapOf(
@@ -302,16 +298,15 @@ class MiruroProvider : MainAPI() {
             return false
         }
 
-        // Step 3: pass HLS streams to CloudStream
         streams.filter { stream: StreamItem ->
             stream.type == "hls" && stream.isActive == true
         }.forEach { stream: StreamItem ->
             callback(
                 newExtractorLink(
-                    source  = name,
-                    name    = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
-                    url     = stream.url,
-                    type    = ExtractorLinkType.M3U8
+                    source = name,
+                    name   = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
+                    url    = stream.url,
+                    type   = ExtractorLinkType.M3U8
                 ) {
                     this.referer = stream.referer ?: "$mainUrl/"
                     this.quality = when (stream.quality) {
