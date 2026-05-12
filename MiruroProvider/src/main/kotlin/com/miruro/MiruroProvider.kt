@@ -51,17 +51,36 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── MAIN PAGE ────────────────────────────────────────────────
-    // "UPDATED_AT_DESC" sorts by most recently updated (new episode activity),
-    // matching Miruro's "Newest" tab which shows recently aired anime.
+    // "NEWEST"        → custom key: status=RELEASING + START_DATE_DESC
+    // "POPULARITY_DESC" → all-time popularity
+    // "TRENDING_DESC"   → currently trending
+    // "SCORE_DESC"      → top rated
     override val mainPage = mainPageOf(
-        "UPDATED_AT_DESC" to "Newest",
+        "NEWEST"          to "Newest",
         "POPULARITY_DESC" to "Popular This Season",
         "TRENDING_DESC"   to "Trending Now",
         "SCORE_DESC"      to "Top Rated"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val graphqlQuery = """
+        // "Newest" uses a dedicated query filtered to currently airing shows
+        val graphqlQuery = if (request.data == "NEWEST") {
+            """
+            query {
+              Page(page: $page, perPage: 20) {
+                media(sort: START_DATE_DESC, type: ANIME, status: RELEASING, isAdult: false) {
+                  id
+                  title { romaji english }
+                  coverImage { large }
+                  format
+                  episodes
+                  status
+                }
+              }
+            }
+            """.trimIndent()
+        } else {
+            """
             query {
               Page(page: $page, perPage: 20) {
                 media(sort: ${request.data}, type: ANIME, isAdult: false) {
@@ -74,7 +93,8 @@ class MiruroProvider : MainAPI() {
                 }
               }
             }
-        """.trimIndent()
+            """.trimIndent()
+        }
 
         val response = app.post(
             anilistUrl,
