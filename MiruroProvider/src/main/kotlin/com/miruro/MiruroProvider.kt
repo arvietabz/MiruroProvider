@@ -51,11 +51,13 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── MAIN PAGE ────────────────────────────────────────────────
+    // "UPDATED_AT_DESC" sorts by most recently updated (new episode activity),
+    // matching Miruro's "Newest" tab which shows recently aired anime.
     override val mainPage = mainPageOf(
-        "TRENDING_DESC"   to "Trending Now",
+        "UPDATED_AT_DESC" to "Newest",
         "POPULARITY_DESC" to "Popular This Season",
-        "SCORE_DESC"      to "Top Rated",
-        "START_DATE_DESC" to "Newest"
+        "TRENDING_DESC"   to "Trending Now",
+        "SCORE_DESC"      to "Top Rated"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
