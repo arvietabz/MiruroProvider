@@ -227,7 +227,7 @@ class MiruroProvider : MainAPI() {
         val status: String?,
         val season: String?,
         val seasonYear: Int?,
-        val studios: StudiosData?
+        val studios: StudiosData?,
         val nextAiringEpisode: NextAiringEpisode?
     )
 
