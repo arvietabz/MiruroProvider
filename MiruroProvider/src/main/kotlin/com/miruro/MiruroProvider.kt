@@ -188,7 +188,7 @@ class MiruroProvider : MainAPI() {
         // Parse episodes from kiwi provider, sub track
         val episodeData = try {
             val decoded = decodePipeResponse(pipeResponse.text)
-            parseJson<XxxResponse>(decoded)
+            parseJson<PipeEpisodesResponse>(decoded)
                 .providers?.kiwi?.episodes?.sub ?: emptyList()
         } catch (ex: Exception) {
             emptyList()
@@ -275,7 +275,7 @@ class MiruroProvider : MainAPI() {
 
         val episodeList = try {
             val decoded = decodePipeResponse(pipeResponse.text)
-            parseJson<XxxResponse>(decoded)
+            parseJson<PipeEpisodesResponse>(decoded)
                 .providers?.kiwi?.episodes?.sub ?: emptyList()
         } catch (ex: Exception) {
             emptyList<EpisodeItem>()  // ← explicitly type the emptyList
@@ -305,7 +305,7 @@ class MiruroProvider : MainAPI() {
 
         val streams = try {
             val decoded = decodePipeResponse(sourcesResponse.text)
-            parseJson<XxxResponse>(decoded).streams ?: emptyList()
+            parseJson<PipeEpisodesResponse>(decoded).streams ?: emptyList()
         } catch (ex: Exception) {
             return false
         }
