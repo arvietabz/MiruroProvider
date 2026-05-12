@@ -129,6 +129,7 @@ class MiruroProvider : MainAPI() {
                 season
                 seasonYear
                 studios { nodes { name } }
+                nextAiringEpisode { episode }
               }
             }
         """.trimIndent()
@@ -145,7 +146,12 @@ class MiruroProvider : MainAPI() {
         val plot    = media.description?.replace(Regex("<.*?>"), "")
         val slug    = slugify(media.title.romaji ?: title)
 
-        val episodeCount = media.episodes ?: 1
+        // For airing anime, episodes is null so we use nextAiringEpisode - 1
+        // For finished anime, we use episodes directly
+        // If both are null somehow, default to 1
+        val episodeCount = media.episodes 
+            ?: media.nextAiringEpisode?.episode?.minus(1) 
+            ?: 1
         val episodes = (1..episodeCount).map { epNum ->
             newEpisode("$mainUrl/watch/${media.id}/$slug?ep=$epNum") {
                 this.episode   = epNum
@@ -222,10 +228,12 @@ class MiruroProvider : MainAPI() {
         val season: String?,
         val seasonYear: Int?,
         val studios: StudiosData?
+        val nextAiringEpisode: NextAiringEpisode?
     )
 
     data class StudiosData(val nodes: List<StudioNode>?)
     data class StudioNode(val name: String?)
+    data class NextAiringEpisode(val episode: Int?)
     data class TitleData(val romaji: String?, val english: String?)
     data class CoverData(val large: String?)
 }
