@@ -149,9 +149,16 @@ class MiruroProvider : MainAPI() {
         // For airing anime, episodes is null so we use nextAiringEpisode - 1
         // For finished anime, we use episodes directly
         // If both are null somehow, default to 1
-        val episodeCount = media.episodes 
-            ?: media.nextAiringEpisode?.episode?.minus(1) 
-            ?: 1
+        val episodeCount = when {
+            // If still airing, use how many have aired so far
+            media.status == "RELEASING" && media.nextAiringEpisode?.episode != null ->
+            media.nextAiringEpisode.episode!! - 1
+            // If finished, use total episode count
+            media.episodes != null ->
+            media.episodes
+            // Fallback
+            else -> 1
+        }
         val episodes = (1..episodeCount).map { epNum ->
             newEpisode("$mainUrl/watch/${media.id}/$slug?ep=$epNum") {
                 this.episode   = epNum
