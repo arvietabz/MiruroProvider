@@ -2,6 +2,7 @@ package com.miruro
 
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
+import com.fasterxml.jackson.annotation.JsonProperty
 
 class MiruroProvider : MainAPI() {
 
@@ -194,7 +195,8 @@ class MiruroProvider : MainAPI() {
 
     // ─── DATA CLASSES ─────────────────────────────────────────────
     data class AnilistSearchResponse(val data: SearchData)
-    data class SearchData(val page: PageData)
+    data class SearchData(@JsonProperty("Page") val page: PageData)
+    data class LoadData(@JsonProperty("Media") val media: MediaDetail)
     data class PageData(val media: List<AnilistMedia>)
     data class AnilistMedia(
         val id: Int,
@@ -206,7 +208,6 @@ class MiruroProvider : MainAPI() {
     )
 
     data class AnilistLoadResponse(val data: LoadData)
-    data class LoadData(val media: MediaDetail)
     data class MediaDetail(
         val id: Int,
         val title: TitleData,
