@@ -128,7 +128,7 @@ class MiruroProvider : MainAPI() {
                 status
                 season
                 seasonYear
-                studios { nodes { name isMain } }
+                studios { nodes { name } }
               }
             }
         """.trimIndent()
@@ -225,7 +225,7 @@ class MiruroProvider : MainAPI() {
     )
 
     data class StudiosData(val nodes: List<StudioNode>?)
-    data class StudioNode(val name: String?, val isMain: Boolean?)
+    data class StudioNode(val name: String?)
     data class TitleData(val romaji: String?, val english: String?)
     data class CoverData(val large: String?)
 }
