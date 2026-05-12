@@ -9,6 +9,15 @@ import java.io.ByteArrayInputStream
 
 class MiruroProvider : MainAPI() {
 
+    companion object {
+        fun slugify(text: String): String {
+            return text.lowercase()
+                .replace(Regex("[^a-z0-9\\s]"), "")
+                .trim()
+                .replace(Regex("\\s+"), "-")
+        }
+    }
+
     override var mainUrl = "https://www.miruro.tv"
     override var name = "Miruro"
     override val hasMainPage = true
@@ -19,14 +28,6 @@ class MiruroProvider : MainAPI() {
     private val anilistUrl = "https://graphql.anilist.co"
     private val pipeUrl = "$mainUrl/api/secure/pipe"
     private val provider = "kiwi"
-
-    // ─── HELPER: slugify ──────────────────────────────────────────
-    private fun slugify(text: String): String {
-        return text.lowercase()
-            .replace(Regex("[^a-z0-9\\s]"), "")
-            .trim()
-            .replace(Regex("\\s+"), "-")
-    }
 
     // ─── HELPER: build pipe payload ───────────────────────────────
     private fun buildPipeParam(path: String, query: Map<String, Any>): String {
@@ -68,14 +69,6 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── MAIN PAGE ────────────────────────────────────────────────
-    // All sections use Miruro's own pipe API — only shows anime
-    // that is actually available on Miruro.
-    //
-    // Sections:
-    //   "recently_updated" → schedule endpoint (airing this week)
-    //   "trending_now"     → search/browse RELEASING TRENDING_DESC
-    //   "recently_finished"→ search/browse FINISHED TRENDING_DESC
-    //   "top_movies"       → search MOVIE SCORE_DESC
     override val mainPage = mainPageOf(
         "recently_updated"  to "Recently Updated",
         "trending_now"      to "Trending Now",
@@ -88,12 +81,11 @@ class MiruroProvider : MainAPI() {
 
             // ── Recently Updated: episodes airing this week ────────
             "recently_updated" -> {
-                val now      = System.currentTimeMillis() / 1000
-                val weekAgo  = now - 7 * 24 * 3600
-                val weekEnd  = now + 7 * 24 * 3600
-                // Round to day boundaries (Miruro uses midnight UTC)
-                val startAt  = (weekAgo / 86400) * 86400
-                val endAt    = (weekEnd / 86400) * 86400
+                val now     = System.currentTimeMillis() / 1000
+                val weekAgo = now - 7 * 24 * 3600
+                val weekEnd = now + 7 * 24 * 3600
+                val startAt = (weekAgo / 86400) * 86400
+                val endAt   = (weekEnd / 86400) * 86400
 
                 val decoded = pipeGet(
                     "schedule",
@@ -104,7 +96,6 @@ class MiruroProvider : MainAPI() {
                     )
                 )
                 val items = AppUtils.parseJson<List<ScheduleItem>>(decoded)
-                // Deduplicate by media id (multiple episodes may air)
                 items
                     .distinctBy { it.media.id }
                     .mapNotNull { it.media.toSearchResult() }
@@ -128,7 +119,6 @@ class MiruroProvider : MainAPI() {
 
             // ── Recently Finished: ended recently, sorted trending ─
             "recently_finished" -> {
-                // endDate_greater: YYYYMMDD format, 6 months ago
                 val sixMonthsAgo = run {
                     val cal = java.util.Calendar.getInstance()
                     cal.add(java.util.Calendar.MONTH, -6)
@@ -140,12 +130,12 @@ class MiruroProvider : MainAPI() {
                 val decoded = pipeGet(
                     "search/browse",
                     mapOf(
-                        "type"             to "ANIME",
-                        "status"           to "FINISHED",
-                        "sort"             to "TRENDING_DESC",
-                        "endDate_greater"  to sixMonthsAgo,
-                        "page"             to page,
-                        "perPage"          to 20
+                        "type"            to "ANIME",
+                        "status"          to "FINISHED",
+                        "sort"            to "TRENDING_DESC",
+                        "endDate_greater" to sixMonthsAgo,
+                        "page"            to page,
+                        "perPage"         to 20
                     )
                 )
                 AppUtils.parseJson<List<BrowseMedia>>(decoded)
@@ -425,10 +415,7 @@ class MiruroProvider : MainAPI() {
     ) {
         fun toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
             val titleStr = title.english ?: title.romaji ?: return null
-            val slug     = titleStr.lowercase()
-                .replace(Regex("[^a-z0-9\\s]"), "")
-                .trim()
-                .replace(Regex("\\s+"), "-")
+            val slug     = MiruroProvider.slugify(titleStr)
             val watchUrl = "https://www.miruro.tv/watch/$id/$slug"
             val tvType   = if (isMovie) TvType.AnimeMovie else TvType.Anime
             return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
@@ -471,10 +458,7 @@ class MiruroProvider : MainAPI() {
     ) {
         fun toSearchResult(): SearchResponse? {
             val title = this.title.english ?: this.title.romaji ?: return null
-            val slug  = title.lowercase()
-                .replace(Regex("[^a-z0-9\\s]"), "")
-                .trim()
-                .replace(Regex("\\s+"), "-")
+            val slug  = MiruroProvider.slugify(title)
             val watchUrl = "https://www.miruro.tv/watch/${this.id}/$slug"
             return newAnimeSearchResponse(title, watchUrl, TvType.Anime) {
                 posterUrl = this@AnilistMedia.coverImage.large
