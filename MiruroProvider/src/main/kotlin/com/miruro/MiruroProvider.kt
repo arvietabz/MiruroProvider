@@ -7,13 +7,77 @@ class MiruroProvider : MainAPI() {
 
     override var mainUrl = "https://www.miruro.tv"
     override var name = "Miruro"
-    override var lang = "en"
     override val hasMainPage = true
+    override var lang = "en"
+    override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
     private val anilistUrl = "https://graphql.anilist.co"
 
-    // ─── SEARCH ──────────────────────────────────────────────────
+    // ─── HELPER ───────────────────────────────────────────────────
+    private fun slugify(text: String): String {
+        return text.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), "")
+            .trim()
+            .replace(Regex("\\s+"), "-")
+    }
+
+    // ─── MAIN PAGE ────────────────────────────────────────────────
+    override val mainPage = mainPageOf(
+        "TRENDING_DESC"   to "Trending Now",
+        "POPULARITY_DESC" to "Popular This Season",
+        "SCORE_DESC"      to "Top Rated",
+        "START_DATE_DESC" to "Newest"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val graphqlQuery = """
+            query {
+              Page(page: $page, perPage: 20) {
+                media(sort: ${request.data}, type: ANIME, isAdult: false) {
+                  id
+                  title { romaji english }
+                  coverImage { large }
+                  format
+                  episodes
+                  status
+                }
+              }
+            }
+        """.trimIndent()
+
+        val response = app.post(
+            anilistUrl,
+            json    = mapOf("query" to graphqlQuery),
+            headers = mapOf("Content-Type" to "application/json")
+        )
+
+        val mediaList = response.parsed<AnilistSearchResponse>()
+            .data.page.media
+
+        val home = mediaList.mapNotNull { it.toSearchResult() }
+
+        return newHomePageResponse(
+            list = HomePageList(
+                name               = request.name,
+                list               = home,
+                isHorizontalImages = false
+            ),
+            hasNext = true
+        )
+    }
+
+    // ─── HELPER: convert a media item to a search card ────────────
+    private fun AnilistMedia.toSearchResult(): SearchResponse? {
+        val title = this.title.english ?: this.title.romaji ?: return null
+        val slug = slugify(this.title.romaji ?: title)
+        val watchUrl = "$mainUrl/watch/${this.id}/$slug"
+        return newAnimeSearchResponse(title, watchUrl, TvType.Anime) {
+            posterUrl = this@toSearchResult.coverImage.large
+        }
+    }
+
+    // ─── SEARCH ───────────────────────────────────────────────────
     override suspend fun search(query: String): List<SearchResponse> {
         val graphqlQuery = """
             query {
@@ -23,6 +87,8 @@ class MiruroProvider : MainAPI() {
                   title { romaji english }
                   coverImage { large }
                   format
+                  episodes
+                  status
                 }
               }
             }
@@ -30,30 +96,21 @@ class MiruroProvider : MainAPI() {
 
         val response = app.post(
             anilistUrl,
-            json = mapOf("query" to graphqlQuery),
+            json    = mapOf("query" to graphqlQuery),
             headers = mapOf("Content-Type" to "application/json")
         )
 
-        // CloudStream's parser maps JSON keys case-insensitively
-        val results = response.parsed<AnilistSearchResponse>()
-
-        return results.data.page.media.mapNotNull { media ->
-            val title = media.title.english ?: media.title.romaji ?: return@mapNotNull null
-            val watchUrl = "$mainUrl/watch/${media.id}"
-
-            newAnimeSearchResponse(
-                name = title,
-                url  = watchUrl,
-                type = TvType.Anime
-            ) {
-                posterUrl = media.coverImage.large
-            }
-        }
+        return response.parsed<AnilistSearchResponse>()
+            .data.page.media
+            .mapNotNull { it.toSearchResult() }
     }
 
     // ─── LOAD ─────────────────────────────────────────────────────
     override suspend fun load(url: String): LoadResponse {
-        val anilistId = url.trimEnd('/').split("/").last()
+        // url = https://www.miruro.tv/watch/147105/witch-hat-atelier
+        // split("/") = ["https:", "", "www.miruro.tv", "watch", "147105", "witch-hat-atelier"]
+        // index 4 = anilist ID
+        val anilistId = url.split("/")[4]
 
         val graphqlQuery = """
             query {
@@ -67,25 +124,31 @@ class MiruroProvider : MainAPI() {
                 format
                 genres
                 averageScore
+                status
+                season
+                seasonYear
+                studios { nodes { name isMain } }
               }
             }
         """.trimIndent()
 
         val response = app.post(
             anilistUrl,
-            json = mapOf("query" to graphqlQuery),
+            json    = mapOf("query" to graphqlQuery),
             headers = mapOf("Content-Type" to "application/json")
         )
 
-        val media = response.parsed<AnilistLoadResponse>().data.media
-
-        val title = media.title.english ?: media.title.romaji ?: "Unknown"
+        val media   = response.parsed<AnilistLoadResponse>().data.media
+        val title   = media.title.english ?: media.title.romaji ?: "Unknown"
         val isMovie = media.format == "MOVIE"
+        val plot    = media.description?.replace(Regex("<.*?>"), "")
+        val slug    = slugify(media.title.romaji ?: title)
 
         val episodeCount = media.episodes ?: 1
         val episodes = (1..episodeCount).map { epNum ->
-            newEpisode("$url?ep=$epNum") {
-                episode = epNum
+            newEpisode("$mainUrl/watch/${media.id}/$slug?ep=$epNum") {
+                this.episode   = epNum
+                this.posterUrl = media.coverImage.large
             }
         }
 
@@ -98,7 +161,7 @@ class MiruroProvider : MainAPI() {
             ) {
                 posterUrl           = media.coverImage.large
                 backgroundPosterUrl = media.bannerImage
-                plot                = media.description?.replace(Regex("<.*?>"), "")
+                this.plot           = plot
                 tags                = media.genres
                 score               = Score.from100(media.averageScore)
             }
@@ -110,7 +173,7 @@ class MiruroProvider : MainAPI() {
             ) {
                 posterUrl           = media.coverImage.large
                 backgroundPosterUrl = media.bannerImage
-                plot                = media.description?.replace(Regex("<.*?>"), "")
+                this.plot           = plot
                 tags                = media.genres
                 score               = Score.from100(media.averageScore)
                 addEpisodes(DubStatus.Subbed, episodes)
@@ -125,21 +188,21 @@ class MiruroProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
+        // TODO: video sources — next step
         return false
     }
 
     // ─── DATA CLASSES ─────────────────────────────────────────────
-    // CloudStream's parser is case-insensitive so "Page" in JSON
-    // maps fine to "page" in the data class, no @SerializedName needed
-
     data class AnilistSearchResponse(val data: SearchData)
     data class SearchData(val page: PageData)
-    data class PageData(val media: List<MediaItem>)
-    data class MediaItem(
+    data class PageData(val media: List<AnilistMedia>)
+    data class AnilistMedia(
         val id: Int,
         val title: TitleData,
         val coverImage: CoverData,
-        val format: String?
+        val format: String?,
+        val episodes: Int?,
+        val status: String?
     )
 
     data class AnilistLoadResponse(val data: LoadData)
@@ -153,9 +216,15 @@ class MiruroProvider : MainAPI() {
         val episodes: Int?,
         val format: String?,
         val genres: List<String>?,
-        val averageScore: Int?
+        val averageScore: Int?,
+        val status: String?,
+        val season: String?,
+        val seasonYear: Int?,
+        val studios: StudiosData?
     )
 
+    data class StudiosData(val nodes: List<StudioNode>?)
+    data class StudioNode(val name: String?, val isMain: Boolean?)
     data class TitleData(val romaji: String?, val english: String?)
     data class CoverData(val large: String?)
 }
