@@ -1,7 +1,7 @@
 {
   "name": "MiruroRepo",
   "description": "My personal Miruro provider",
-  "manifestVersion": 1,
+  "manifestVersion": 1.01,
   "pluginLists": [
     "https://raw.githubusercontent.com/arvietabz/MiruroProvider/builds/plugins.json"
   ]
