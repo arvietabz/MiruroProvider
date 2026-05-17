@@ -20,14 +20,15 @@ class MiruroProvider : MainAPI() {
     private val pipeUrl = "$mainUrl/api/secure/pipe"
 
     // ─── PROVIDER CONFIG ──────────────────────────────────────────
-    // Order here = order streams appear in the CloudStream source picker.
-    // "sub"  = hardsub providers (kiwi, ally) — no external subtitle track
-    // "ssub" = softsub providers (bee, dune, hop) — carry a subtitles array
+    // "sub"  = hardsub providers (kiwi, nun) — no external subtitle track
+    // "ssub" = softsub providers (bee, hop)  — carry a subtitles array
+    //
+    // NOTE: streams are collected from ALL providers first, then emitted
+    // in this order so CloudStream auto-selects Bee Vidstream-2 by default.
     private val providers = listOf(
-        ProviderConfig("bee",  "ssub", "Bee"),   // Vidstream-2 (priority 2) first, VidCloud-1 (priority 4) second
-        ProviderConfig("kiwi", "sub",  "Kiwi"),  // active 720p preferred
-        ProviderConfig("dune", "ssub", "Dune"),  // single HLS stream, many subtitle langs
-        ProviderConfig("ally", "sub",  "Ally"),
+        ProviderConfig("bee",  "ssub", "Bee"),   // Vidstream-2 (priority 2), VidCloud-1 (priority 4)
+        ProviderConfig("kiwi", "sub",  "Kiwi"),  // SubsPlease 720p active stream
+        ProviderConfig("nun",  "sub",  "Nun"),   // embed of ally, sub category
         ProviderConfig("hop",  "ssub", "Hop")
     )
 
@@ -102,15 +103,9 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── HELPER: fetch episode list for a given provider ──────────
-    // The /episodes endpoint can return two shapes:
-    //
-    //  Shape A — providers wrapper (kiwi, ally, bee, hop):
-    //    { "providers": { "kiwi": { "episodes": { "sub": [...], "ssub": [...] } } } }
-    //
-    //  Shape B — flat list (dune uses animedunya IDs):
-    //    [ { "id": "animedunya:62050:1", "number": 1, ... }, ... ]
-    //
-    // We try Shape A first; if providers is null/empty we fall back to Shape B.
+    // The /episodes endpoint returns a providers wrapper:
+    //   { "providers": { "kiwi": { "episodes": { "sub": [...] } }, "bee": { "episodes": { "ssub": [...] } }, ... } }
+    // ssub list is preferred over sub for softsub providers (bee, hop).
     private suspend fun fetchEpisodes(anilistId: Int, provider: String): List<EpisodeItem> {
         return try {
             val decoded = pipeGet(
@@ -124,9 +119,8 @@ class MiruroProvider : MainAPI() {
                 resp.providers?.let { p ->
                     when (provider) {
                         "kiwi" -> p.kiwi?.episodes
-                        "ally" -> p.ally?.episodes
                         "bee"  -> p.bee?.episodes
-                        "dune" -> p.dune?.episodes
+                        "nun"  -> p.nun?.episodes
                         "hop"  -> p.hop?.episodes
                         else   -> null
                     }
@@ -136,14 +130,7 @@ class MiruroProvider : MainAPI() {
                 }
             } catch (e: Exception) { null }
 
-            if (!fromWrapper.isNullOrEmpty()) return fromWrapper
-
-            // Try Shape B: flat list (dune returns a bare array with animedunya IDs)
-            try {
-                AppUtils.parseJson<List<EpisodeItem>>(decoded).takeIf { it.isNotEmpty() } ?: emptyList()
-            } catch (e: Exception) {
-                emptyList()
-            }
+            fromWrapper?.takeIf { it.isNotEmpty() } ?: emptyList()
         } catch (ex: Exception) {
             emptyList()
         }
@@ -374,7 +361,14 @@ class MiruroProvider : MainAPI() {
         val anilistId = data.split("/")[4].toInt()
         val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
 
-        var foundAny = false
+        // Collect all provider results first, then emit in list order.
+        // This guarantees CloudStream auto-selects Bee Vidstream-2 regardless
+        // of which provider's network request completes first.
+        data class PendingStream(val linkName: String, val stream: StreamItem, val providerLabel: String)
+        data class PendingSubtitle(val lang: String, val url: String)
+
+        val allStreams   = mutableListOf<PendingStream>()
+        val allSubtitles = mutableListOf<PendingSubtitle>()
 
         for (providerConfig in providers) {
             try {
@@ -386,20 +380,17 @@ class MiruroProvider : MainAPI() {
                     .firstOrNull { it.number == epNum }
                     ?.id ?: continue
 
-                // 2. Build sources query — each provider needs slightly different params:
-                //    kiwi/ally (sub):  episodeId + provider + category
-                //    bee (ssub):       + anilistId + ttl (cache hint)
-                //    dune (ssub):      episodeId uses animedunya IDs, no anilistId/ttl needed
+                // 2. Build sources query:
+                //    kiwi / nun (sub):  episodeId + provider + category
+                //    bee / hop (ssub):  + anilistId; bee also gets ttl for CDN caching
                 val sourcesQuery: Map<String, Any> = buildMap {
                     put("episodeId", episodeId)
                     put("provider",  providerConfig.id)
                     put("category",  providerConfig.category)
-                    // bee needs anilistId for subtitle lookup and ttl for caching
                     if (providerConfig.id == "bee") {
                         put("anilistId", anilistId)
                         put("ttl", 86400)
                     }
-                    // hop also benefits from anilistId
                     if (providerConfig.id == "hop") put("anilistId", anilistId)
                 }
 
@@ -415,66 +406,39 @@ class MiruroProvider : MainAPI() {
                 val decoded = decodePipeResponse(sourcesResponse.text)
                 val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
 
-                // 3. Handle subtitles (ssub providers return these).
-                //    Deduplicate by language code — bee returns duplicate URLs for the
-                //    same language from different CDN hosts; dune returns many languages.
-                //    We keep only the first entry per language to avoid duplicates in
-                //    the CloudStream subtitle picker.
+                // 3. Collect subtitles — deduplicate by language code.
+                //    bee returns duplicate URLs for the same language from different CDN hosts.
+                //    We keep only the first occurrence per language.
                 val seenLangs = mutableSetOf<String>()
                 resp.subtitles?.forEach { sub ->
                     if (!sub.file.isNullOrBlank()) {
                         val langKey = sub.language ?: sub.label ?: "unknown"
-                        if (seenLangs.add(langKey)) {   // add() returns false if already present
-                            subtitleCallback(
-                                SubtitleFile(
-                                    lang = sub.label ?: sub.language ?: "Unknown",
-                                    url  = sub.file
-                                )
-                            )
+                        if (seenLangs.add(langKey)) {
+                            allSubtitles.add(PendingSubtitle(
+                                lang = sub.label ?: sub.language ?: "Unknown",
+                                url  = sub.file
+                            ))
                         }
                     }
                 }
 
-                // 4. Emit HLS streams
-                val streams = resp.streams ?: continue
-
-                // kiwi-style: has isActive flag → prefer active ones but fall back to all
-                // bee-style:  has priority + default flag, no isActive
-                val hlsStreams = streams.filter { it.type == "hls" }
+                // 4. Collect HLS streams for this provider
+                val streams    = resp.streams ?: continue
+                val hlsStreams  = streams.filter { it.type == "hls" }
                 if (hlsStreams.isEmpty()) continue
 
+                // kiwi: filter to isActive==true streams; fall back to all if none active
+                // bee/hop: no isActive flag — sort by priority ascending (lower = better quality/preference)
                 val activeStreams = hlsStreams.filter { it.isActive == true }
-                val toEmit = activeStreams.ifEmpty {
-                    // For providers without isActive (bee, dune, hop): emit all HLS,
-                    // sorted by priority ascending (lower = better)
+                val toCollect = activeStreams.ifEmpty {
                     hlsStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
                 }
 
-                toEmit.forEach { stream ->
-                    // Build a human-readable source name:
-                    // e.g. "Kiwi SubsPlease 720p" or "Bee Vidstream-2 1080p"
+                toCollect.forEach { stream ->
                     val serverLabel = stream.fansub ?: stream.server ?: "Unknown"
                     val qualityTag  = stream.quality ?: ""
                     val linkName    = "${providerConfig.label} $serverLabel $qualityTag".trim()
-
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name   = linkName,
-                            url    = stream.url,
-                            type   = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = stream.referer ?: "$mainUrl/"
-                            this.quality = when (stream.quality) {
-                                "1080p" -> Qualities.P1080.value
-                                "720p"  -> Qualities.P720.value
-                                "480p"  -> Qualities.P480.value
-                                "360p"  -> Qualities.P360.value
-                                else    -> Qualities.Unknown.value
-                            }
-                        }
-                    )
-                    foundAny = true
+                    allStreams.add(PendingStream(linkName, stream, providerConfig.label))
                 }
 
             } catch (ex: Exception) {
@@ -483,7 +447,34 @@ class MiruroProvider : MainAPI() {
             }
         }
 
-        return foundAny
+        // Emit subtitles first (so CloudStream can match them to streams)
+        allSubtitles.forEach { sub ->
+            subtitleCallback(SubtitleFile(lang = sub.lang, url = sub.url))
+        }
+
+        // Emit streams in collected order — Bee Vidstream-2 first, then Bee VidCloud-1,
+        // then Kiwi, then Nun, then Hop — so CloudStream auto-selects Bee Vidstream-2.
+        allStreams.forEach { pending ->
+            callback(
+                newExtractorLink(
+                    source = name,
+                    name   = pending.linkName,
+                    url    = pending.stream.url,
+                    type   = ExtractorLinkType.M3U8
+                ) {
+                    this.referer = pending.stream.referer ?: "$mainUrl/"
+                    this.quality = when (pending.stream.quality) {
+                        "1080p" -> Qualities.P1080.value
+                        "720p"  -> Qualities.P720.value
+                        "480p"  -> Qualities.P480.value
+                        "360p"  -> Qualities.P360.value
+                        else    -> Qualities.Unknown.value
+                    }
+                }
+            )
+        }
+
+        return allStreams.isNotEmpty()
     }
 
     // ─── DATA CLASSES: Schedule API ───────────────────────────────
@@ -578,9 +569,8 @@ class MiruroProvider : MainAPI() {
     data class PipeEpisodesResponse(val providers: ProvidersData?)
     data class ProvidersData(
         val kiwi: ProviderData?,
-        val ally: ProviderData?,
         val bee:  ProviderData?,
-        val dune: ProviderData?,
+        val nun:  ProviderData?,
         val hop:  ProviderData?
     )
     data class ProviderData(val episodes: EpisodesData?)
