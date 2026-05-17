@@ -23,16 +23,11 @@ class MiruroProvider : MainAPI() {
     private val pipeUrl = "$mainUrl/api/secure/pipe"
 
     // ─── PROVIDER CONFIG ──────────────────────────────────────────
-    // "sub"  = hardsub providers (kiwi, nun) — no external subtitle track
-    // "ssub" = softsub providers (bee, hop)  — carry a subtitles array
-    //
-    // NOTE: streams are collected from ALL providers first, then emitted
-    // in this order so CloudStream auto-selects Bee Vidstream-2 by default.
+    // kiwi: HLS + embed pairs per quality; emit only isActive==true ones
+    // ally: embed-only streams (ok.ru, mp4upload, bysekoze, allanime)
     private val providers = listOf(
-        ProviderConfig("bee",  "ssub", "Bee"),   // Vidstream-2 (priority 2), VidCloud-1 (priority 4)
-        ProviderConfig("kiwi", "sub",  "Kiwi"),  // SubsPlease 720p active stream
-        ProviderConfig("nun",  "sub",  "Nun"),   // embed of ally, sub category
-        ProviderConfig("hop",  "ssub", "Hop")
+        ProviderConfig("kiwi", "sub", "Kiwi"),
+        ProviderConfig("ally", "sub", "Ally")
     )
 
     data class ProviderConfig(val id: String, val category: String, val label: String)
@@ -106,9 +101,7 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── HELPER: fetch episode list for a given provider ──────────
-    // The /episodes endpoint returns a providers wrapper:
-    //   { "providers": { "kiwi": { "episodes": { "sub": [...] } }, "bee": { "episodes": { "ssub": [...] } }, ... } }
-    // ssub list is preferred over sub for softsub providers (bee, hop).
+    // /episodes returns: { "providers": { "kiwi": { "episodes": { "sub": [...] } }, "ally": { ... } } }
     private suspend fun fetchEpisodes(anilistId: Int, provider: String): List<EpisodeItem> {
         return try {
             val decoded = pipeGet(
@@ -116,21 +109,15 @@ class MiruroProvider : MainAPI() {
                 mapOf("anilistId" to anilistId, "provider" to provider)
             )
 
-            // Try Shape A: wrapped providers object
             val fromWrapper = try {
                 val resp = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
                 resp.providers?.let { p ->
                     when (provider) {
                         "kiwi" -> p.kiwi?.episodes
-                        "bee"  -> p.bee?.episodes
-                        "nun"  -> p.nun?.episodes
-                        "hop"  -> p.hop?.episodes
+                        "ally" -> p.ally?.episodes
                         else   -> null
                     }
-                }?.let { eps ->
-                    // ssub takes priority over sub (softsub providers carry external subtitle tracks)
-                    eps.ssub?.takeIf { it.isNotEmpty() } ?: eps.sub
-                }
+                }?.let { eps -> eps.sub }
             } catch (e: Exception) { null }
 
             fromWrapper?.takeIf { it.isNotEmpty() } ?: emptyList()
@@ -387,17 +374,12 @@ class MiruroProvider : MainAPI() {
                             .firstOrNull { it.number == epNum }
                             ?.id ?: return@async ProviderResult(emptyList(), emptyList())
 
-                        // 2. Sources query — params vary by provider
-                        val sourcesQuery: Map<String, Any> = buildMap {
-                            put("episodeId", episodeId)
-                            put("provider",  providerConfig.id)
-                            put("category",  providerConfig.category)
-                            if (providerConfig.id == "bee") {
-                                put("anilistId", anilistId)
-                                put("ttl", 86400)
-                            }
-                            if (providerConfig.id == "hop") put("anilistId", anilistId)
-                        }
+                        // 2. Sources query — kiwi and ally both use the basic 3 params
+                        val sourcesQuery: Map<String, Any> = mapOf(
+                            "episodeId" to episodeId,
+                            "provider"  to providerConfig.id,
+                            "category"  to providerConfig.category
+                        )
 
                         val sourcesE = buildPipeParam("sources", sourcesQuery)
                         val sourcesResponse = app.get(
@@ -423,24 +405,24 @@ class MiruroProvider : MainAPI() {
                             }
                         }
 
-                        // 4. Streams — HLS preferred; also include embed streams
-                        //    (nun/ally only return embeds; CloudStream will attempt extraction)
+                        // 4. Streams
                         val streams = resp.streams ?: return@async ProviderResult(emptyList(), subtitles)
 
-                        val hlsStreams   = streams.filter { it.type == "hls" }
-                        val embedStreams = streams.filter { it.type == "embed" }
-
-                        // For HLS: kiwi uses isActive flag; bee/hop sort by priority
-                        val activeHls   = hlsStreams.filter { it.isActive == true }
-                        val pickedHls   = activeHls.ifEmpty {
-                            hlsStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
+                        val toCollect: List<StreamItem> = when (providerConfig.id) {
+                            "kiwi" -> {
+                                // kiwi: isActive==true HLS first, then isActive==true embeds as fallback
+                                val activeHls   = streams.filter { it.type == "hls"   && it.isActive == true }
+                                val activeEmbed = streams.filter { it.type == "embed"  && it.isActive == true }
+                                activeHls + activeEmbed
+                            }
+                            "ally" -> {
+                                // ally: embed-only, sorted by priority ascending (1 = best)
+                                streams.filter { it.type == "embed" }
+                                    .sortedBy { it.priority ?: Int.MAX_VALUE }
+                            }
+                            else -> emptyList()
                         }
 
-                        // For embed: sort by priority ascending and take all
-                        val pickedEmbed = embedStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
-
-                        // HLS first, then embeds — so HLS is always preferred
-                        val toCollect = pickedHls + pickedEmbed
                         if (toCollect.isEmpty()) return@async ProviderResult(emptyList(), subtitles)
 
                         val pending = toCollect.map { stream ->
@@ -459,7 +441,7 @@ class MiruroProvider : MainAPI() {
             }.awaitAll()
         }
 
-        // ── Emit in provider list order (bee → kiwi → nun → hop) ─────────────
+        // ── Emit in provider list order (kiwi → ally) ────────────────────────
         // Subtitles first so CloudStream can correlate them before streams arrive
         results.forEach { result ->
             result.subtitles.forEach { sub ->
@@ -489,7 +471,7 @@ class MiruroProvider : MainAPI() {
                         }
                     )
                 } else {
-                    // Embed streams (nun, hop fallback): hand off to CloudStream's
+                    // Embed streams (ally): hand off to CloudStream's
                     // built-in extractor chain — handles ok.ru, mp4upload, etc.
                     loadExtractor(
                         url              = pending.stream.url,
@@ -592,19 +574,16 @@ class MiruroProvider : MainAPI() {
     // ─── DATA CLASSES: Pipe Episodes API ─────────────────────────
     // The /episodes endpoint returns a "providers" object where each key
     // is a provider name, and the value contains an "episodes" object
-    // with optional "sub" and "ssub" lists.
+    // with optional "sub" list.
     data class PipeEpisodesResponse(val providers: ProvidersData?)
     data class ProvidersData(
         val kiwi: ProviderData?,
-        val bee:  ProviderData?,
-        val nun:  ProviderData?,
-        val hop:  ProviderData?
+        val ally: ProviderData?
     )
     data class ProviderData(val episodes: EpisodesData?)
     data class EpisodesData(
-        val sub:  List<EpisodeItem>?,
-        val ssub: List<EpisodeItem>?,
-        val dub:  List<EpisodeItem>?
+        val sub: List<EpisodeItem>?,
+        val dub: List<EpisodeItem>?
     )
     data class EpisodeItem(
         val id: String,
@@ -618,10 +597,9 @@ class MiruroProvider : MainAPI() {
     )
 
     // ─── DATA CLASSES: Pipe Sources API ──────────────────────────
-    // Unified stream model covering both kiwi-style and bee-style responses.
     // kiwi fields: fansub, isActive, quality
-    // bee fields:  server, priority, default
-    // Both have: url, type, referer
+    // ally fields: server, priority  (embed-only, no isActive)
+    // Both have:   url, type, referer
     data class SourcesResponse(
         val streams:   List<StreamItem>?,
         val subtitles: List<SubtitleItem>?,
@@ -635,7 +613,7 @@ class MiruroProvider : MainAPI() {
         // kiwi-style
         val fansub:   String?,
         val isActive: Boolean?,
-        // bee-style
+        // ally-style
         val server:   String?,
         val priority: Int?,
         @JsonProperty("default")
