@@ -18,7 +18,20 @@ class MiruroProvider : MainAPI() {
 
     private val anilistUrl = "https://graphql.anilist.co"
     private val pipeUrl = "$mainUrl/api/secure/pipe"
-    private val provider = "kiwi"
+
+    // ─── PROVIDER CONFIG ──────────────────────────────────────────
+    // Each entry: triple of (providerName, category, label shown to user)
+    // "sub"  = hardsub providers (kiwi, ally)
+    // "ssub" = softsub providers with separate subtitle track (bee, dune, hop)
+    private val providers = listOf(
+        ProviderConfig("kiwi", "sub",  "Kiwi"),
+        ProviderConfig("ally", "sub",  "Ally"),
+        ProviderConfig("bee",  "ssub", "Bee"),
+        ProviderConfig("dune", "ssub", "Dune"),
+        ProviderConfig("hop",  "ssub", "Hop")
+    )
+
+    data class ProviderConfig(val id: String, val category: String, val label: String)
 
     // ─── HELPER: slugify ──────────────────────────────────────────
     private fun slugify(text: String): String {
@@ -29,9 +42,6 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── HELPER: BrowseMedia → SearchResponse ─────────────────────
-    // Defined as extension functions inside the class body so they
-    // have access to class members (slugify, mainUrl, newAnimeSearchResponse)
-    // without any data class needing to reference the outer class.
     private fun BrowseMedia.toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
         val titleStr = title.english ?: title.romaji ?: return null
         val slug     = slugify(titleStr)
@@ -89,6 +99,33 @@ class MiruroProvider : MainAPI() {
             )
         )
         return decodePipeResponse(response.text)
+    }
+
+    // ─── HELPER: fetch episode list for a given provider ──────────
+    private suspend fun fetchEpisodes(anilistId: Int, provider: String): List<EpisodeItem> {
+        return try {
+            val decoded = pipeGet(
+                "episodes",
+                mapOf("anilistId" to anilistId, "provider" to provider)
+            )
+            val resp = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
+            // Each provider may have sub or ssub episodes; return whichever is populated
+            resp.providers?.let { p ->
+                when (provider) {
+                    "kiwi" -> p.kiwi?.episodes
+                    "ally" -> p.ally?.episodes
+                    "bee"  -> p.bee?.episodes
+                    "dune" -> p.dune?.episodes
+                    "hop"  -> p.hop?.episodes
+                    else   -> null
+                }
+            }?.let { eps ->
+                // prefer ssub list if present, else sub
+                eps.ssub?.takeIf { it.isNotEmpty() } ?: eps.sub ?: emptyList()
+            } ?: emptyList()
+        } catch (ex: Exception) {
+            emptyList()
+        }
     }
 
     // ─── MAIN PAGE ────────────────────────────────────────────────
@@ -250,25 +287,8 @@ class MiruroProvider : MainAPI() {
         val plot    = media.description?.replace(Regex("<.*?>"), "")
         val slug    = slugify(media.title.romaji ?: title)
 
-        val e = buildPipeParam(
-            path  = "episodes",
-            query = mapOf("anilistId" to anilistId, "provider" to provider)
-        )
-        val pipeResponse = app.get(
-            "$pipeUrl?e=$e",
-            headers = mapOf(
-                "Referer" to "$mainUrl/",
-                "Origin"  to mainUrl
-            )
-        )
-
-        val episodeData: List<EpisodeItem> = try {
-            val decoded = decodePipeResponse(pipeResponse.text)
-            AppUtils.parseJson<PipeEpisodesResponse>(decoded)
-                .providers?.kiwi?.episodes?.sub ?: emptyList()
-        } catch (ex: Exception) {
-            emptyList()
-        }
+        // Use kiwi as the primary source for episode metadata (titles, thumbnails, etc.)
+        val episodeData = fetchEpisodes(anilistId, "kiwi")
 
         val episodes = if (episodeData.isNotEmpty()) {
             episodeData.map { ep: EpisodeItem ->
@@ -333,77 +353,100 @@ class MiruroProvider : MainAPI() {
         val anilistId = data.split("/")[4].toInt()
         val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
 
-        val e = buildPipeParam(
-            path  = "episodes",
-            query = mapOf("anilistId" to anilistId, "provider" to provider)
-        )
-        val pipeResponse = app.get(
-            "$pipeUrl?e=$e",
-            headers = mapOf(
-                "Referer" to "$mainUrl/",
-                "Origin"  to mainUrl
-            )
-        )
+        var foundAny = false
 
-        val episodeList: List<EpisodeItem> = try {
-            val decoded = decodePipeResponse(pipeResponse.text)
-            AppUtils.parseJson<PipeEpisodesResponse>(decoded)
-                .providers?.kiwi?.episodes?.sub ?: emptyList()
-        } catch (ex: Exception) {
-            return false
-        }
+        for (providerConfig in providers) {
+            try {
+                // 1. Get episode list for this provider
+                val episodeList = fetchEpisodes(anilistId, providerConfig.id)
+                if (episodeList.isEmpty()) continue
 
-        val episodeId = episodeList
-            .firstOrNull { ep: EpisodeItem -> ep.number == epNum }
-            ?.id ?: return false
+                val episodeId = episodeList
+                    .firstOrNull { it.number == epNum }
+                    ?.id ?: continue
 
-        val sourcesE = buildPipeParam(
-            path  = "sources",
-            query = mapOf(
-                "episodeId"  to episodeId,
-                "provider"   to provider,
-                "category"   to "sub",
-                "anilistId"  to anilistId
-            )
-        )
-        val sourcesResponse = app.get(
-            "$pipeUrl?e=$sourcesE",
-            headers = mapOf(
-                "Referer" to "$mainUrl/",
-                "Origin"  to mainUrl
-            )
-        )
+                // 2. Build sources query — bee also needs anilistId + ttl
+                val sourcesQuery: Map<String, Any> = buildMap {
+                    put("episodeId", episodeId)
+                    put("provider",  providerConfig.id)
+                    put("category",  providerConfig.category)
+                    put("anilistId", anilistId)
+                    if (providerConfig.category == "ssub") put("ttl", 86400)
+                }
 
-        val streams: List<StreamItem> = try {
-            val decoded = decodePipeResponse(sourcesResponse.text)
-            AppUtils.parseJson<SourcesResponse>(decoded).streams ?: emptyList()
-        } catch (ex: Exception) {
-            return false
-        }
+                val sourcesE = buildPipeParam("sources", sourcesQuery)
+                val sourcesResponse = app.get(
+                    "$pipeUrl?e=$sourcesE",
+                    headers = mapOf(
+                        "Referer" to "$mainUrl/",
+                        "Origin"  to mainUrl
+                    )
+                )
 
-        streams.filter { stream: StreamItem ->
-            stream.type == "hls" && stream.isActive == true
-        }.forEach { stream: StreamItem ->
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name   = "${stream.fansub ?: "Unknown"} ${stream.quality ?: ""}".trim(),
-                    url    = stream.url,
-                    type   = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = stream.referer ?: "$mainUrl/"
-                    this.quality = when (stream.quality) {
-                        "1080p" -> Qualities.P1080.value
-                        "720p"  -> Qualities.P720.value
-                        "480p"  -> Qualities.P480.value
-                        "360p"  -> Qualities.P360.value
-                        else    -> Qualities.Unknown.value
+                val decoded = decodePipeResponse(sourcesResponse.text)
+                val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
+
+                // 3. Handle subtitles (bee / ssub providers return these)
+                resp.subtitles?.forEach { sub ->
+                    if (!sub.file.isNullOrBlank()) {
+                        subtitleCallback(
+                            SubtitleFile(
+                                lang = sub.label ?: sub.language ?: "Unknown",
+                                url  = sub.file
+                            )
+                        )
                     }
                 }
-            )
+
+                // 4. Emit HLS streams
+                val streams = resp.streams ?: continue
+
+                // kiwi-style: has isActive flag → prefer active ones but fall back to all
+                // bee-style:  has priority + default flag, no isActive
+                val hlsStreams = streams.filter { it.type == "hls" }
+                if (hlsStreams.isEmpty()) continue
+
+                val activeStreams = hlsStreams.filter { it.isActive == true }
+                val toEmit = activeStreams.ifEmpty {
+                    // For providers without isActive (bee, dune, hop): emit all HLS,
+                    // sorted by priority ascending (lower = better)
+                    hlsStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
+                }
+
+                toEmit.forEach { stream ->
+                    // Build a human-readable source name:
+                    // e.g. "Kiwi SubsPlease 720p" or "Bee Vidstream-2 1080p"
+                    val serverLabel = stream.fansub ?: stream.server ?: "Unknown"
+                    val qualityTag  = stream.quality ?: ""
+                    val linkName    = "${providerConfig.label} $serverLabel $qualityTag".trim()
+
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name   = linkName,
+                            url    = stream.url,
+                            type   = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = stream.referer ?: "$mainUrl/"
+                            this.quality = when (stream.quality) {
+                                "1080p" -> Qualities.P1080.value
+                                "720p"  -> Qualities.P720.value
+                                "480p"  -> Qualities.P480.value
+                                "360p"  -> Qualities.P360.value
+                                else    -> Qualities.Unknown.value
+                            }
+                        }
+                    )
+                    foundAny = true
+                }
+
+            } catch (ex: Exception) {
+                // Provider failed silently; try the next one
+                continue
+            }
         }
 
-        return true
+        return foundAny
     }
 
     // ─── DATA CLASSES: Schedule API ───────────────────────────────
@@ -491,11 +534,24 @@ class MiruroProvider : MainAPI() {
     data class TitleData(val romaji: String?, val english: String?)
     data class CoverData(val large: String?)
 
-    // ─── DATA CLASSES: Pipe API ───────────────────────────────────
+    // ─── DATA CLASSES: Pipe Episodes API ─────────────────────────
+    // The /episodes endpoint returns a "providers" object where each key
+    // is a provider name, and the value contains an "episodes" object
+    // with optional "sub" and "ssub" lists.
     data class PipeEpisodesResponse(val providers: ProvidersData?)
-    data class ProvidersData(val kiwi: ProviderData?)
+    data class ProvidersData(
+        val kiwi: ProviderData?,
+        val ally: ProviderData?,
+        val bee:  ProviderData?,
+        val dune: ProviderData?,
+        val hop:  ProviderData?
+    )
     data class ProviderData(val episodes: EpisodesData?)
-    data class EpisodesData(val sub: List<EpisodeItem>?, val dub: List<EpisodeItem>?)
+    data class EpisodesData(
+        val sub:  List<EpisodeItem>?,
+        val ssub: List<EpisodeItem>?,
+        val dub:  List<EpisodeItem>?
+    )
     data class EpisodeItem(
         val id: String,
         val number: Int,
@@ -507,14 +563,40 @@ class MiruroProvider : MainAPI() {
         val filler: Boolean?
     )
 
-    data class SourcesResponse(val streams: List<StreamItem>?)
+    // ─── DATA CLASSES: Pipe Sources API ──────────────────────────
+    // Unified stream model covering both kiwi-style and bee-style responses.
+    // kiwi fields: fansub, isActive, quality
+    // bee fields:  server, priority, default
+    // Both have: url, type, referer
+    data class SourcesResponse(
+        val streams:   List<StreamItem>?,
+        val subtitles: List<SubtitleItem>?,
+        val download:  String?
+    )
     data class StreamItem(
-        val url: String,
-        val type: String?,
-        val quality: String?,
-        val audio: String?,
-        val fansub: String?,
+        val url:      String,
+        val type:     String?,
+        val quality:  String?,
+        val audio:    String?,
+        // kiwi-style
+        val fansub:   String?,
         val isActive: Boolean?,
-        val referer: String?
+        // bee-style
+        val server:   String?,
+        val priority: Int?,
+        @JsonProperty("default")
+        val isDefault: Boolean?,
+        // shared
+        val referer:  String?
+    )
+    data class SubtitleItem(
+        val file:     String?,
+        val label:    String?,
+        val kind:     String?,
+        @JsonProperty("default")
+        val isDefault: Boolean?,
+        val language: String?,
+        val format:   String?,
+        val encoding: String?
     )
 }
