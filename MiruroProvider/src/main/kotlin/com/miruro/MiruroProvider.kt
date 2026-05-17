@@ -6,6 +6,9 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import android.util.Base64
 import java.util.zip.GZIPInputStream
 import java.io.ByteArrayInputStream
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 class MiruroProvider : MainAPI() {
 
@@ -361,120 +364,133 @@ class MiruroProvider : MainAPI() {
         val anilistId = data.split("/")[4].toInt()
         val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
 
-        // Collect all provider results first, then emit in list order.
-        // This guarantees CloudStream auto-selects Bee Vidstream-2 regardless
-        // of which provider's network request completes first.
-        data class PendingStream(val linkName: String, val stream: StreamItem, val providerLabel: String)
+        data class PendingStream(val linkName: String, val stream: StreamItem)
         data class PendingSubtitle(val lang: String, val url: String)
+        data class ProviderResult(
+            val streams:   List<PendingStream>,
+            val subtitles: List<PendingSubtitle>
+        )
 
-        val allStreams   = mutableListOf<PendingStream>()
-        val allSubtitles = mutableListOf<PendingSubtitle>()
+        // ── Fetch all providers CONCURRENTLY, preserving list order ──────────
+        // coroutineScope launches each provider in parallel; awaitAll() waits
+        // for every deferred before we emit anything, so the first callback()
+        // call is always Bee Vidstream-2 regardless of network timing.
+        val results: List<ProviderResult> = coroutineScope {
+            providers.map { providerConfig ->
+                async {
+                    try {
+                        // 1. Episode list
+                        val episodeList = fetchEpisodes(anilistId, providerConfig.id)
+                        if (episodeList.isEmpty()) return@async ProviderResult(emptyList(), emptyList())
 
-        for (providerConfig in providers) {
-            try {
-                // 1. Get episode list for this provider
-                val episodeList = fetchEpisodes(anilistId, providerConfig.id)
-                if (episodeList.isEmpty()) continue
+                        val episodeId = episodeList
+                            .firstOrNull { it.number == epNum }
+                            ?.id ?: return@async ProviderResult(emptyList(), emptyList())
 
-                val episodeId = episodeList
-                    .firstOrNull { it.number == epNum }
-                    ?.id ?: continue
-
-                // 2. Build sources query:
-                //    kiwi / nun (sub):  episodeId + provider + category
-                //    bee / hop (ssub):  + anilistId; bee also gets ttl for CDN caching
-                val sourcesQuery: Map<String, Any> = buildMap {
-                    put("episodeId", episodeId)
-                    put("provider",  providerConfig.id)
-                    put("category",  providerConfig.category)
-                    if (providerConfig.id == "bee") {
-                        put("anilistId", anilistId)
-                        put("ttl", 86400)
-                    }
-                    if (providerConfig.id == "hop") put("anilistId", anilistId)
-                }
-
-                val sourcesE = buildPipeParam("sources", sourcesQuery)
-                val sourcesResponse = app.get(
-                    "$pipeUrl?e=$sourcesE",
-                    headers = mapOf(
-                        "Referer" to "$mainUrl/",
-                        "Origin"  to mainUrl
-                    )
-                )
-
-                val decoded = decodePipeResponse(sourcesResponse.text)
-                val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
-
-                // 3. Collect subtitles — deduplicate by language code.
-                //    bee returns duplicate URLs for the same language from different CDN hosts.
-                //    We keep only the first occurrence per language.
-                val seenLangs = mutableSetOf<String>()
-                resp.subtitles?.forEach { sub ->
-                    if (!sub.file.isNullOrBlank()) {
-                        val langKey = sub.language ?: sub.label ?: "unknown"
-                        if (seenLangs.add(langKey)) {
-                            allSubtitles.add(PendingSubtitle(
-                                lang = sub.label ?: sub.language ?: "Unknown",
-                                url  = sub.file
-                            ))
+                        // 2. Sources query — params vary by provider
+                        val sourcesQuery: Map<String, Any> = buildMap {
+                            put("episodeId", episodeId)
+                            put("provider",  providerConfig.id)
+                            put("category",  providerConfig.category)
+                            if (providerConfig.id == "bee") {
+                                put("anilistId", anilistId)
+                                put("ttl", 86400)
+                            }
+                            if (providerConfig.id == "hop") put("anilistId", anilistId)
                         }
+
+                        val sourcesE = buildPipeParam("sources", sourcesQuery)
+                        val sourcesResponse = app.get(
+                            "$pipeUrl?e=$sourcesE",
+                            headers = mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl)
+                        )
+
+                        val decoded = decodePipeResponse(sourcesResponse.text)
+                        val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
+
+                        // 3. Subtitles — deduplicate by language code
+                        val seenLangs  = mutableSetOf<String>()
+                        val subtitles  = mutableListOf<PendingSubtitle>()
+                        resp.subtitles?.forEach { sub ->
+                            if (!sub.file.isNullOrBlank()) {
+                                val key = sub.language ?: sub.label ?: "unknown"
+                                if (seenLangs.add(key)) {
+                                    subtitles.add(PendingSubtitle(
+                                        lang = sub.label ?: sub.language ?: "Unknown",
+                                        url  = sub.file
+                                    ))
+                                }
+                            }
+                        }
+
+                        // 4. Streams — HLS preferred; also include embed streams
+                        //    (nun/ally only return embeds; CloudStream will attempt extraction)
+                        val streams = resp.streams ?: return@async ProviderResult(emptyList(), subtitles)
+
+                        val hlsStreams   = streams.filter { it.type == "hls" }
+                        val embedStreams = streams.filter { it.type == "embed" }
+
+                        // For HLS: kiwi uses isActive flag; bee/hop sort by priority
+                        val activeHls   = hlsStreams.filter { it.isActive == true }
+                        val pickedHls   = activeHls.ifEmpty {
+                            hlsStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
+                        }
+
+                        // For embed: sort by priority ascending and take all
+                        val pickedEmbed = embedStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
+
+                        // HLS first, then embeds — so HLS is always preferred
+                        val toCollect = pickedHls + pickedEmbed
+                        if (toCollect.isEmpty()) return@async ProviderResult(emptyList(), subtitles)
+
+                        val pending = toCollect.map { stream ->
+                            val serverLabel = stream.fansub ?: stream.server ?: "Unknown"
+                            val qualityTag  = stream.quality ?: ""
+                            val linkName    = "${providerConfig.label} $serverLabel $qualityTag".trim()
+                            PendingStream(linkName, stream)
+                        }
+
+                        ProviderResult(pending, subtitles)
+
+                    } catch (ex: Exception) {
+                        ProviderResult(emptyList(), emptyList())
                     }
                 }
+            }.awaitAll()
+        }
 
-                // 4. Collect HLS streams for this provider
-                val streams    = resp.streams ?: continue
-                val hlsStreams  = streams.filter { it.type == "hls" }
-                if (hlsStreams.isEmpty()) continue
-
-                // kiwi: filter to isActive==true streams; fall back to all if none active
-                // bee/hop: no isActive flag — sort by priority ascending (lower = better quality/preference)
-                val activeStreams = hlsStreams.filter { it.isActive == true }
-                val toCollect = activeStreams.ifEmpty {
-                    hlsStreams.sortedBy { it.priority ?: Int.MAX_VALUE }
-                }
-
-                toCollect.forEach { stream ->
-                    val serverLabel = stream.fansub ?: stream.server ?: "Unknown"
-                    val qualityTag  = stream.quality ?: ""
-                    val linkName    = "${providerConfig.label} $serverLabel $qualityTag".trim()
-                    allStreams.add(PendingStream(linkName, stream, providerConfig.label))
-                }
-
-            } catch (ex: Exception) {
-                // Provider failed silently; try the next one
-                continue
+        // ── Emit in provider list order (bee → kiwi → nun → hop) ─────────────
+        // Subtitles first so CloudStream can correlate them before streams arrive
+        results.forEach { result ->
+            result.subtitles.forEach { sub ->
+                subtitleCallback(SubtitleFile(lang = sub.lang, url = sub.url))
             }
         }
 
-        // Emit subtitles first (so CloudStream can match them to streams)
-        allSubtitles.forEach { sub ->
-            subtitleCallback(SubtitleFile(lang = sub.lang, url = sub.url))
-        }
-
-        // Emit streams in collected order — Bee Vidstream-2 first, then Bee VidCloud-1,
-        // then Kiwi, then Nun, then Hop — so CloudStream auto-selects Bee Vidstream-2.
-        allStreams.forEach { pending ->
-            callback(
-                newExtractorLink(
-                    source = name,
-                    name   = pending.linkName,
-                    url    = pending.stream.url,
-                    type   = ExtractorLinkType.M3U8
-                ) {
-                    this.referer = pending.stream.referer ?: "$mainUrl/"
-                    this.quality = when (pending.stream.quality) {
-                        "1080p" -> Qualities.P1080.value
-                        "720p"  -> Qualities.P720.value
-                        "480p"  -> Qualities.P480.value
-                        "360p"  -> Qualities.P360.value
-                        else    -> Qualities.Unknown.value
+        results.forEach { result ->
+            result.streams.forEach { pending ->
+                val isHls = pending.stream.type == "hls"
+                callback(
+                    newExtractorLink(
+                        source = name,
+                        name   = pending.linkName,
+                        url    = pending.stream.url,
+                        type   = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.UNKNOWN
+                    ) {
+                        this.referer = pending.stream.referer ?: "$mainUrl/"
+                        this.quality = when (pending.stream.quality) {
+                            "1080p" -> Qualities.P1080.value
+                            "720p"  -> Qualities.P720.value
+                            "480p"  -> Qualities.P480.value
+                            "360p"  -> Qualities.P360.value
+                            else    -> Qualities.Unknown.value
+                        }
                     }
-                }
-            )
+                )
+            }
         }
 
-        return allStreams.isNotEmpty()
+        return results.any { it.streams.isNotEmpty() }
     }
 
     // ─── DATA CLASSES: Schedule API ───────────────────────────────
