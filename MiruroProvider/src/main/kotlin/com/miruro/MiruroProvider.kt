@@ -469,24 +469,35 @@ class MiruroProvider : MainAPI() {
 
         results.forEach { result ->
             result.streams.forEach { pending ->
-                val isHls = pending.stream.type == "hls"
-                callback(
-                    newExtractorLink(
-                        source = name,
-                        name   = pending.linkName,
-                        url    = pending.stream.url,
-                        type   = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.UNKNOWN
-                    ) {
-                        this.referer = pending.stream.referer ?: "$mainUrl/"
-                        this.quality = when (pending.stream.quality) {
-                            "1080p" -> Qualities.P1080.value
-                            "720p"  -> Qualities.P720.value
-                            "480p"  -> Qualities.P480.value
-                            "360p"  -> Qualities.P360.value
-                            else    -> Qualities.Unknown.value
+                if (pending.stream.type == "hls") {
+                    // HLS streams: emit directly with quality hint
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name   = pending.linkName,
+                            url    = pending.stream.url,
+                            type   = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = pending.stream.referer ?: "$mainUrl/"
+                            this.quality = when (pending.stream.quality) {
+                                "1080p" -> Qualities.P1080.value
+                                "720p"  -> Qualities.P720.value
+                                "480p"  -> Qualities.P480.value
+                                "360p"  -> Qualities.P360.value
+                                else    -> Qualities.Unknown.value
+                            }
                         }
-                    }
-                )
+                    )
+                } else {
+                    // Embed streams (nun, hop fallback): hand off to CloudStream's
+                    // built-in extractor chain — handles ok.ru, mp4upload, etc.
+                    loadExtractor(
+                        url              = pending.stream.url,
+                        referer          = pending.stream.referer ?: "$mainUrl/",
+                        subtitleCallback = subtitleCallback,
+                        callback         = callback
+                    )
+                }
             }
         }
 
