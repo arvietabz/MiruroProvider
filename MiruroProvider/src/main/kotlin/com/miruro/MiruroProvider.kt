@@ -20,14 +20,14 @@ class MiruroProvider : MainAPI() {
     private val pipeUrl = "$mainUrl/api/secure/pipe"
 
     // ─── PROVIDER CONFIG ──────────────────────────────────────────
-    // Each entry: triple of (providerName, category, label shown to user)
-    // "sub"  = hardsub providers (kiwi, ally)
-    // "ssub" = softsub providers with separate subtitle track (bee, dune, hop)
+    // Order here = order streams appear in the CloudStream source picker.
+    // "sub"  = hardsub providers (kiwi, ally) — no external subtitle track
+    // "ssub" = softsub providers (bee, dune, hop) — carry a subtitles array
     private val providers = listOf(
-        ProviderConfig("kiwi", "sub",  "Kiwi"),
+        ProviderConfig("bee",  "ssub", "Bee"),   // Vidstream-2 (priority 2) first, VidCloud-1 (priority 4) second
+        ProviderConfig("kiwi", "sub",  "Kiwi"),  // active 720p preferred
+        ProviderConfig("dune", "ssub", "Dune"),  // single HLS stream, many subtitle langs
         ProviderConfig("ally", "sub",  "Ally"),
-        ProviderConfig("bee",  "ssub", "Bee"),
-        ProviderConfig("dune", "ssub", "Dune"),
         ProviderConfig("hop",  "ssub", "Hop")
     )
 
@@ -102,27 +102,48 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── HELPER: fetch episode list for a given provider ──────────
+    // The /episodes endpoint can return two shapes:
+    //
+    //  Shape A — providers wrapper (kiwi, ally, bee, hop):
+    //    { "providers": { "kiwi": { "episodes": { "sub": [...], "ssub": [...] } } } }
+    //
+    //  Shape B — flat list (dune uses animedunya IDs):
+    //    [ { "id": "animedunya:62050:1", "number": 1, ... }, ... ]
+    //
+    // We try Shape A first; if providers is null/empty we fall back to Shape B.
     private suspend fun fetchEpisodes(anilistId: Int, provider: String): List<EpisodeItem> {
         return try {
             val decoded = pipeGet(
                 "episodes",
                 mapOf("anilistId" to anilistId, "provider" to provider)
             )
-            val resp = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
-            // Each provider may have sub or ssub episodes; return whichever is populated
-            resp.providers?.let { p ->
-                when (provider) {
-                    "kiwi" -> p.kiwi?.episodes
-                    "ally" -> p.ally?.episodes
-                    "bee"  -> p.bee?.episodes
-                    "dune" -> p.dune?.episodes
-                    "hop"  -> p.hop?.episodes
-                    else   -> null
+
+            // Try Shape A: wrapped providers object
+            val fromWrapper = try {
+                val resp = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
+                resp.providers?.let { p ->
+                    when (provider) {
+                        "kiwi" -> p.kiwi?.episodes
+                        "ally" -> p.ally?.episodes
+                        "bee"  -> p.bee?.episodes
+                        "dune" -> p.dune?.episodes
+                        "hop"  -> p.hop?.episodes
+                        else   -> null
+                    }
+                }?.let { eps ->
+                    // ssub takes priority over sub (softsub providers carry external subtitle tracks)
+                    eps.ssub?.takeIf { it.isNotEmpty() } ?: eps.sub
                 }
-            }?.let { eps ->
-                // prefer ssub list if present, else sub
-                eps.ssub?.takeIf { it.isNotEmpty() } ?: eps.sub ?: emptyList()
-            } ?: emptyList()
+            } catch (e: Exception) { null }
+
+            if (!fromWrapper.isNullOrEmpty()) return fromWrapper
+
+            // Try Shape B: flat list (dune returns a bare array with animedunya IDs)
+            try {
+                AppUtils.parseJson<List<EpisodeItem>>(decoded).takeIf { it.isNotEmpty() } ?: emptyList()
+            } catch (e: Exception) {
+                emptyList()
+            }
         } catch (ex: Exception) {
             emptyList()
         }
@@ -365,13 +386,21 @@ class MiruroProvider : MainAPI() {
                     .firstOrNull { it.number == epNum }
                     ?.id ?: continue
 
-                // 2. Build sources query — bee also needs anilistId + ttl
+                // 2. Build sources query — each provider needs slightly different params:
+                //    kiwi/ally (sub):  episodeId + provider + category
+                //    bee (ssub):       + anilistId + ttl (cache hint)
+                //    dune (ssub):      episodeId uses animedunya IDs, no anilistId/ttl needed
                 val sourcesQuery: Map<String, Any> = buildMap {
                     put("episodeId", episodeId)
                     put("provider",  providerConfig.id)
                     put("category",  providerConfig.category)
-                    put("anilistId", anilistId)
-                    if (providerConfig.category == "ssub") put("ttl", 86400)
+                    // bee needs anilistId for subtitle lookup and ttl for caching
+                    if (providerConfig.id == "bee") {
+                        put("anilistId", anilistId)
+                        put("ttl", 86400)
+                    }
+                    // hop also benefits from anilistId
+                    if (providerConfig.id == "hop") put("anilistId", anilistId)
                 }
 
                 val sourcesE = buildPipeParam("sources", sourcesQuery)
@@ -386,15 +415,23 @@ class MiruroProvider : MainAPI() {
                 val decoded = decodePipeResponse(sourcesResponse.text)
                 val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
 
-                // 3. Handle subtitles (bee / ssub providers return these)
+                // 3. Handle subtitles (ssub providers return these).
+                //    Deduplicate by language code — bee returns duplicate URLs for the
+                //    same language from different CDN hosts; dune returns many languages.
+                //    We keep only the first entry per language to avoid duplicates in
+                //    the CloudStream subtitle picker.
+                val seenLangs = mutableSetOf<String>()
                 resp.subtitles?.forEach { sub ->
                     if (!sub.file.isNullOrBlank()) {
-                        subtitleCallback(
-                            SubtitleFile(
-                                lang = sub.label ?: sub.language ?: "Unknown",
-                                url  = sub.file
+                        val langKey = sub.language ?: sub.label ?: "unknown"
+                        if (seenLangs.add(langKey)) {   // add() returns false if already present
+                            subtitleCallback(
+                                SubtitleFile(
+                                    lang = sub.label ?: sub.language ?: "Unknown",
+                                    url  = sub.file
+                                )
                             )
-                        )
+                        }
                     }
                 }
 
