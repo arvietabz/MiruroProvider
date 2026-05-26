@@ -31,7 +31,7 @@ class MiruroProvider : MainAPI() {
 
     // ── Backends ─────────────────────────────────────────────────────────────
     // Consumet instance miruro.tv itself uses (found in their .env.example)
-    private val CONSUMET  = "https://public-miruro-consumet-api.vercel.app"
+    private val CONSUMET  = "https://api-consumet-org-nu-silk.vercel.app"
     private val ANISKIP   = "https://api.aniskip.com/v2"
     private val ANILIST   = "https://graphql.anilist.co"
 
