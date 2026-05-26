@@ -198,27 +198,20 @@ class MiruroProvider : MainAPI() {
         val anilistId = data.split("/")[4]
 
         // ── 1. AniSkip timestamps (fire-and-forget, best effort) ─────────────
+        // FIX: Use query string directly instead of params map to avoid
+        // Map<String, Any> type mismatch caused by passing a List value.
         if (malId != null) {
             try {
                 val skipRes = app.get(
-                    "$ANISKIP/skip-times/$malId/$epNum",
-                    params = mapOf(
-                        "types[]"         to listOf("op", "ed"),
-                        "episodeLength"   to "0"
-                    )
+                    "$ANISKIP/skip-times/$malId/$epNum?types[]=op&types[]=ed&episodeLength=0"
                 )
                 val skip = AppUtils.parseJson<AniSkipResult>(skipRes.text)
-                // CloudStream reads these via the Episode object; we surface them
-                // as subtitle-like callbacks with a special lang tag that the
-                // player overlay picks up (depends on your CS3 fork / player).
                 skip.results?.forEach { item ->
                     val label = when (item.skipType) {
                         "op" -> "Opening (skip)"
                         "ed" -> "Ending (skip)"
                         else -> item.skipType ?: return@forEach
                     }
-                    // Store as a "subtitle" file with JSON payload — common CS3 pattern
-                    // for passing skip data; player checks lang == "skip"
                     subtitleCallback(SubtitleFile(
                         lang = "skip:${item.skipType}:${item.interval?.startTime?.toInt()}:" +
                                "${item.interval?.endTime?.toInt()}",
