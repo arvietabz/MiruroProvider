@@ -3,433 +3,632 @@ package com.miruro
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.annotation.JsonProperty
+import android.util.Base64
+import java.util.zip.GZIPInputStream
+import java.io.ByteArrayInputStream
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 
-/**
- * MiruroProvider
- *
- * Bypasses miruro.tv's encrypted /api/secure/pipe by calling the same
- * Consumet backend it forwards to: public-miruro-consumet-api.vercel.app
- *
- * Features:
- *  - Sub + Dub support (zoro/gogoanime both carry dub episodes)
- *  - 3 providers tried in parallel: zoro, animepahe, gogoanime
- *  - AniSkip intro/outro timestamps
- *  - Full main page (trending, popular, top-rated, recent, movies)
- *  - Search via AniList advanced-search
- */
 class MiruroProvider : MainAPI() {
 
-    override var mainUrl            = "https://www.miruro.tv"
-    override var name               = "Miruro"
-    override val hasMainPage        = true
-    override var lang               = "en"
+    override var mainUrl = "https://www.miruro.tv"
+    override var name = "Miruro"
+    override val hasMainPage = true
+    override var lang = "en"
     override val hasDownloadSupport = true
-    override val supportedTypes     = setOf(TvType.Anime, TvType.AnimeMovie)
+    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
 
-    // ── Backends ─────────────────────────────────────────────────────────────
-    // Consumet instance miruro.tv itself uses (found in their .env.example)
-    private val CONSUMET  = "https://api-consumet-org-nu-silk.vercel.app"
-    private val ANISKIP   = "https://api.aniskip.com/v2"
-    private val ANILIST   = "https://graphql.anilist.co"
+    private val anilistUrl = "https://graphql.anilist.co"
+    private val pipeUrl = "$mainUrl/api/secure/pipe"
 
-    // ── Providers tried in order (sub) ───────────────────────────────────────
-    // zoro      = hianime.to  → has separate subtitle files (best quality)
-    // animepahe = animepahe.com → hard-subbed, good 720p quality
-    // gogoanime = anitaku.pe  → also carries dub, wide catalogue
-    private val SUB_PROVIDERS = listOf("zoro", "animepahe", "gogoanime")
+    // ─── PROVIDER CONFIG ──────────────────────────────────────────
+    // kiwi: HLS + embed pairs per quality; emit only isActive==true ones
+    // ally: embed-only streams (ok.ru, mp4upload, bysekoze, allanime)
+    private val providers = listOf(
+        ProviderConfig("kiwi", "sub", "Kiwi"),
+        ProviderConfig("ally", "sub", "Ally")
+    )
 
-    // ── Providers that carry dub episodes ────────────────────────────────────
-    // zoro episode list contains isDub=true episodes when dub exists
-    // gogoanime has separate "-dub" series IDs mapped by consumet
-    private val DUB_PROVIDERS = listOf("zoro", "gogoanime")
+    data class ProviderConfig(val id: String, val category: String, val label: String)
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
-    private fun slugify(text: String) = text.lowercase()
-        .replace(Regex("[^a-z0-9\\s-]"), "").trim()
-        .replace(Regex("\\s+"), "-")
+    // ─── HELPER: slugify ──────────────────────────────────────────
+    private fun slugify(text: String): String {
+        return text.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), "")
+            .trim()
+            .replace(Regex("\\s+"), "-")
+    }
 
-    private fun CMedia.toSearchResult(): SearchResponse? {
-        val t = title?.english ?: title?.romaji ?: return null
-        val type = if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
-        return newAnimeSearchResponse(t, "$mainUrl/watch/$id/${slugify(t)}", type) {
-            posterUrl = image
+    // ─── HELPER: BrowseMedia → SearchResponse ─────────────────────
+    private fun BrowseMedia.toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
+        val titleStr = title.english ?: title.romaji ?: return null
+        val slug     = slugify(titleStr)
+        val watchUrl = "$mainUrl/watch/$id/$slug"
+        val tvType   = if (isMovie) TvType.AnimeMovie else TvType.Anime
+        return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
+            posterUrl = coverImage.large
         }
     }
 
-    // ─── MAIN PAGE ────────────────────────────────────────────────────────────
+    // ─── HELPER: AnilistMedia → SearchResponse ────────────────────
+    private fun AnilistMedia.toSearchResult(): SearchResponse? {
+        val titleStr = title.english ?: title.romaji ?: return null
+        val slug     = slugify(titleStr)
+        val watchUrl = "$mainUrl/watch/$id/$slug"
+        return newAnimeSearchResponse(titleStr, watchUrl, TvType.Anime) {
+            posterUrl = coverImage.large
+        }
+    }
+
+    // ─── HELPER: build pipe payload ───────────────────────────────
+    private fun buildPipeParam(path: String, query: Map<String, Any>): String {
+        val payload = """{"path":"$path","method":"GET","query":${
+            query.entries.joinToString(",", "{", "}") { (k, v) ->
+                when (v) {
+                    is String  -> "\"$k\":\"$v\""
+                    is Boolean -> "\"$k\":$v"
+                    is List<*> -> "\"$k\":${v.joinToString(",", "[", "]") { "\"$it\"" }}"
+                    else       -> "\"$k\":$v"
+                }
+            }
+        },"body":null}"""
+        return Base64.encodeToString(
+            payload.toByteArray(),
+            Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
+        )
+    }
+
+    // ─── HELPER: decode pipe response ─────────────────────────────
+    private fun decodePipeResponse(text: String): String {
+        val bytes = Base64.decode(text, Base64.URL_SAFE)
+        return GZIPInputStream(ByteArrayInputStream(bytes))
+            .bufferedReader()
+            .readText()
+    }
+
+    // ─── HELPER: pipe GET request ─────────────────────────────────
+    private suspend fun pipeGet(path: String, query: Map<String, Any>): String {
+        val e = buildPipeParam(path, query)
+        val response = app.get(
+            "$pipeUrl?e=$e",
+            headers = mapOf(
+                "Referer" to "$mainUrl/",
+                "Origin"  to mainUrl
+            )
+        )
+        return decodePipeResponse(response.text)
+    }
+
+    // ─── HELPER: fetch episode list for a given provider ──────────
+    // /episodes returns: { "providers": { "kiwi": { "episodes": { "sub": [...] } }, "ally": { ... } } }
+    private suspend fun fetchEpisodes(anilistId: Int, provider: String): List<EpisodeItem> {
+        return try {
+            val decoded = pipeGet(
+                "episodes",
+                mapOf("anilistId" to anilistId, "provider" to provider)
+            )
+
+            val fromWrapper = try {
+                val resp = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
+                resp.providers?.let { p ->
+                    when (provider) {
+                        "kiwi" -> p.kiwi?.episodes
+                        "ally" -> p.ally?.episodes
+                        else   -> null
+                    }
+                }?.let { eps -> eps.sub }
+            } catch (e: Exception) { null }
+
+            fromWrapper?.takeIf { it.isNotEmpty() } ?: emptyList()
+        } catch (ex: Exception) {
+            emptyList()
+        }
+    }
+
+    // ─── MAIN PAGE ────────────────────────────────────────────────
     override val mainPage = mainPageOf(
-        "TRENDING_DESC/RELEASING"   to "Trending Now",
-        "POPULARITY_DESC/RELEASING" to "Popular Airing",
-        "SCORE_DESC/FINISHED"       to "Top Rated",
-        "TRENDING_DESC/FINISHED"    to "Recently Finished",
-        "POPULARITY_DESC/MOVIE"     to "Top Movies"
+        "recently_updated"  to "Recently Updated",
+        "trending_now"      to "Trending Now",
+        "recently_finished" to "Recently Finished",
+        "top_movies"        to "Top Movies"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val (sort, statusOrFormat) = request.data.split("/")
-        val isMovie = statusOrFormat == "MOVIE"
-        val params  = buildMap {
-            put("sort",    "[$sort]")
-            put("page",    page.toString())
-            put("perPage", "20")
-            if (isMovie) put("format", "MOVIE") else put("status", statusOrFormat)
-        }
-        val res   = app.get("$CONSUMET/meta/anilist/advanced-search", params = params)
-        val paged = AppUtils.parseJson<CPage>(res.text)
-        val items = paged.results?.mapNotNull { it.toSearchResult() } ?: emptyList()
-        return newHomePageResponse(
-            HomePageList(request.name, items, isHorizontalImages = false),
-            hasNext = paged.hasNextPage == true
-        )
-    }
+        val home: List<SearchResponse> = when (request.data) {
 
-    // ─── SEARCH ───────────────────────────────────────────────────────────────
-    override suspend fun search(query: String): List<SearchResponse> {
-        val res = app.get(
-            "$CONSUMET/meta/anilist/advanced-search",
-            params = mapOf("query" to query, "perPage" to "20")
-        )
-        return AppUtils.parseJson<CPage>(res.text)
-            .results?.mapNotNull { it.toSearchResult() } ?: emptyList()
-    }
+            "recently_updated" -> {
+                val now     = System.currentTimeMillis() / 1000
+                val weekAgo = now - 7 * 24 * 3600
+                val weekEnd = now + 7 * 24 * 3600
+                val startAt = (weekAgo / 86400) * 86400
+                val endAt   = (weekEnd / 86400) * 86400
 
-    // ─── LOAD ─────────────────────────────────────────────────────────────────
-    override suspend fun load(url: String): LoadResponse {
-        // URL format: https://www.miruro.tv/watch/{anilistId}/{slug}
-        val anilistId = url.split("/")[4]
-
-        // Fetch info + episode list from first provider that has episodes
-        var info: CInfo? = null
-        for (prov in SUB_PROVIDERS) {
-            try {
-                val r = app.get(
-                    "$CONSUMET/meta/anilist/info/$anilistId",
-                    params = mapOf("provider" to prov)
+                val decoded = pipeGet(
+                    "schedule",
+                    mapOf(
+                        "startAt" to startAt,
+                        "endAt"   to endAt,
+                        "sort"    to listOf("TIME_DESC")
+                    )
                 )
-                val parsed = AppUtils.parseJson<CInfo>(r.text)
-                if (!parsed.episodes.isNullOrEmpty()) { info = parsed; break }
-                if (info == null) info = parsed // keep even if empty (for metadata)
-            } catch (_: Exception) {}
-        }
-        info ?: throw ErrorLoadingException("Could not load anime info for $anilistId")
+                val items = AppUtils.parseJson<List<ScheduleItem>>(decoded)
+                items
+                    .distinctBy { it.media.id }
+                    .mapNotNull { it.media.toSearchResult() }
+            }
 
-        val title   = info.title?.english ?: info.title?.romaji ?: "Unknown"
-        val slug    = slugify(info.title?.romaji ?: title)
-        val plot    = info.description?.replace(Regex("<.*?>"), "")
-        val isMovie = info.type == "MOVIE"
-        val base    = "$mainUrl/watch/$anilistId/$slug"
-        val malId   = info.malId
+            "trending_now" -> {
+                val decoded = pipeGet(
+                    "search/browse",
+                    mapOf(
+                        "type"    to "ANIME",
+                        "status"  to "RELEASING",
+                        "sort"    to "TRENDING_DESC",
+                        "page"    to page,
+                        "perPage" to 20
+                    )
+                )
+                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                    .mapNotNull { it.toSearchResult() }
+            }
 
-        // ── Split episodes into sub and dub ───────────────────────────────────
-        // Consumet marks dub episodes with isDub=true in the same list (zoro)
-        val allEps  = info.episodes ?: emptyList()
-        val subEps  = allEps.filter { it.isDub != true }
-        val dubEps  = allEps.filter { it.isDub == true }
-
-        fun List<CEpisode>.toCloudStreamEps(dub: Boolean): List<Episode> =
-            map { ep ->
-                // Encode malId for AniSkip lookup + isDub flag so loadLinks knows
-                val epUrl = "$base?ep=${ep.number}&epId=${ep.id}" +
-                        "&malId=${malId ?: ""}&dub=${if (dub) "1" else "0"}"
-                newEpisode(epUrl) {
-                    episode     = ep.number
-                    name        = ep.title
-                    posterUrl   = ep.image
-                    description = ep.description
+            "recently_finished" -> {
+                val sixMonthsAgo = run {
+                    val cal = java.util.Calendar.getInstance()
+                    cal.add(java.util.Calendar.MONTH, -6)
+                    val y = cal.get(java.util.Calendar.YEAR)
+                    val m = cal.get(java.util.Calendar.MONTH) + 1
+                    val d = cal.get(java.util.Calendar.DAY_OF_MONTH)
+                    y * 10000 + m * 100 + d
                 }
+                val decoded = pipeGet(
+                    "search/browse",
+                    mapOf(
+                        "type"            to "ANIME",
+                        "status"          to "FINISHED",
+                        "sort"            to "TRENDING_DESC",
+                        "endDate_greater" to sixMonthsAgo,
+                        "page"            to page,
+                        "perPage"         to 20
+                    )
+                )
+                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                    .mapNotNull { it.toSearchResult() }
             }
 
-        // Fallback stubs if no episodes from any provider
-        fun fallbackEps(dub: Boolean): List<Episode> {
-            val count = when {
-                info.status == "RELEASING" && info.nextAiringEpisode?.episode != null ->
-                    (info.nextAiringEpisode.episode ?: 1) - 1
-                info.totalEpisodes != null -> info.totalEpisodes
-                else -> 1
+            "top_movies" -> {
+                val offset  = (page - 1) * 20
+                val decoded = pipeGet(
+                    "search",
+                    mapOf(
+                        "format" to "MOVIE",
+                        "sort"   to "SCORE_DESC",
+                        "limit"  to 20,
+                        "offset" to offset
+                    )
+                )
+                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                    .mapNotNull { it.toSearchResult(isMovie = true) }
             }
-            return (1..count).map { n ->
-                newEpisode("$base?ep=$n&malId=${malId ?: ""}&dub=${if (dub) "1" else "0"}") {
-                    episode   = n
-                    posterUrl = info.image
-                }
-            }
+
+            else -> emptyList()
         }
 
-        val subList = subEps.toCloudStreamEps(false).ifEmpty { fallbackEps(false) }
-        val dubList = dubEps.toCloudStreamEps(true)
+        return newHomePageResponse(
+            list    = HomePageList(name = request.name, list = home, isHorizontalImages = false),
+            hasNext = true
+        )
+    }
 
-        return if (isMovie) {
-            newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
-                posterUrl           = info.image
-                backgroundPosterUrl = info.cover
-                this.plot           = plot
-                tags                = info.genres
-                score               = Score.from100(info.rating)
-                year                = info.releaseDate?.toIntOrNull()
+    // ─── SEARCH ───────────────────────────────────────────────────
+    override suspend fun search(query: String): List<SearchResponse> {
+        val graphqlQuery = """
+            query {
+              Page(perPage: 20) {
+                media(search: "$query", type: ANIME, isAdult: false) {
+                  id
+                  title { romaji english }
+                  coverImage { large }
+                  format
+                  episodes
+                  status
+                }
+              }
+            }
+        """.trimIndent()
+
+        val response = app.post(
+            anilistUrl,
+            json    = mapOf("query" to graphqlQuery),
+            headers = mapOf("Content-Type" to "application/json")
+        )
+
+        return AppUtils.parseJson<AnilistSearchResponse>(response.text)
+            .data.page.media
+            .mapNotNull { it.toSearchResult() }
+    }
+
+    // ─── LOAD ─────────────────────────────────────────────────────
+    override suspend fun load(url: String): LoadResponse {
+        val anilistId = url.split("/")[4].toInt()
+
+        val graphqlQuery = """
+            query {
+              Media(id: $anilistId, type: ANIME) {
+                id
+                title { romaji english }
+                description
+                coverImage { large }
+                bannerImage
+                episodes
+                format
+                genres
+                averageScore
+                status
+                season
+                seasonYear
+                studios { nodes { name } }
+                nextAiringEpisode { episode }
+              }
+            }
+        """.trimIndent()
+
+        val anilistResponse = app.post(
+            anilistUrl,
+            json    = mapOf("query" to graphqlQuery),
+            headers = mapOf("Content-Type" to "application/json")
+        )
+        val media   = AppUtils.parseJson<AnilistLoadResponse>(anilistResponse.text).data.media
+        val title   = media.title.english ?: media.title.romaji ?: "Unknown"
+        val isMovie = media.format == "MOVIE"
+        val plot    = media.description?.replace(Regex("<.*?>"), "")
+        val slug    = slugify(media.title.romaji ?: title)
+
+        // Use kiwi as the primary source for episode metadata (titles, thumbnails, etc.)
+        val episodeData = fetchEpisodes(anilistId, "kiwi")
+
+        val episodes = if (episodeData.isNotEmpty()) {
+            episodeData.map { ep: EpisodeItem ->
+                newEpisode("$mainUrl/watch/$anilistId/$slug?ep=${ep.number}") {
+                    this.episode     = ep.number
+                    this.name        = ep.title
+                    this.posterUrl   = ep.image
+                    this.description = ep.description
+                }
             }
         } else {
-            newAnimeLoadResponse(title, url, TvType.Anime) {
-                posterUrl           = info.image
-                backgroundPosterUrl = info.cover
+            val episodeCount = when {
+                media.status == "RELEASING" && media.nextAiringEpisode?.episode != null ->
+                    (media.nextAiringEpisode.episode ?: 1) - 1
+                media.episodes != null -> media.episodes
+                else -> 1
+            }
+            (1..episodeCount).map { epNum ->
+                newEpisode("$mainUrl/watch/$anilistId/$slug?ep=$epNum") {
+                    this.episode   = epNum
+                    this.posterUrl = media.coverImage.large
+                }
+            }
+        }
+
+        return if (isMovie) {
+            newMovieLoadResponse(
+                name    = title,
+                url     = url,
+                type    = TvType.AnimeMovie,
+                dataUrl = url
+            ) {
+                posterUrl           = media.coverImage.large
+                backgroundPosterUrl = media.bannerImage
                 this.plot           = plot
-                tags                = info.genres
-                score               = Score.from100(info.rating)
-                year                = info.releaseDate?.toIntOrNull()
-                addEpisodes(DubStatus.Subbed, subList)
-                if (dubList.isNotEmpty()) addEpisodes(DubStatus.Dubbed, dubList)
+                tags                = media.genres
+                score               = Score.from100(media.averageScore)
+            }
+        } else {
+            newAnimeLoadResponse(
+                name = title,
+                url  = url,
+                type = TvType.Anime
+            ) {
+                posterUrl           = media.coverImage.large
+                backgroundPosterUrl = media.bannerImage
+                this.plot           = plot
+                tags                = media.genres
+                score               = Score.from100(media.averageScore)
+                addEpisodes(DubStatus.Subbed, episodes)
             }
         }
     }
 
-    // ─── LOAD LINKS ───────────────────────────────────────────────────────────
+    // ─── LOAD LINKS ───────────────────────────────────────────────
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val epNum  = data.substringAfter("?ep=").substringBefore("&").toIntOrNull() ?: 1
-        val epId   = data.substringAfter("epId=").substringBefore("&").takeIf { it.isNotBlank() }
-        val malId  = data.substringAfter("malId=").substringBefore("&").takeIf { it.isNotBlank() }
-        val isDub  = data.substringAfter("dub=").substringBefore("&") == "1"
-        val anilistId = data.split("/")[4]
+        val anilistId = data.split("/")[4].toInt()
+        val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
 
-        // ── 1. AniSkip timestamps (fire-and-forget, best effort) ─────────────
-        // FIX: Use query string directly instead of params map to avoid
-        // Map<String, Any> type mismatch caused by passing a List value.
-        if (malId != null) {
-            try {
-                val skipRes = app.get(
-                    "$ANISKIP/skip-times/$malId/$epNum?types[]=op&types[]=ed&episodeLength=0"
-                )
-                val skip = AppUtils.parseJson<AniSkipResult>(skipRes.text)
-                skip.results?.forEach { item ->
-                    val label = when (item.skipType) {
-                        "op" -> "Opening (skip)"
-                        "ed" -> "Ending (skip)"
-                        else -> item.skipType ?: return@forEach
-                    }
-                    subtitleCallback(SubtitleFile(
-                        lang = "skip:${item.skipType}:${item.interval?.startTime?.toInt()}:" +
-                               "${item.interval?.endTime?.toInt()}",
-                        url  = label
-                    ))
-                }
-            } catch (_: Exception) {}
-        }
-
-        // ── 2. Sources from all providers in parallel ─────────────────────────
-        data class PendingStream(val name: String, val stream: CSource)
-        data class ProvResult(
+        data class PendingStream(val linkName: String, val stream: StreamItem)
+        data class PendingSubtitle(val lang: String, val url: String)
+        data class ProviderResult(
             val streams:   List<PendingStream>,
-            val subtitles: List<CSubtitle>
+            val subtitles: List<PendingSubtitle>
         )
 
-        val providers = if (isDub) DUB_PROVIDERS else SUB_PROVIDERS
-
-        val results: List<ProvResult> = coroutineScope {
-            providers.map { prov ->
+        // ── Fetch all providers CONCURRENTLY, preserving list order ──────────
+        // coroutineScope launches each provider in parallel; awaitAll() waits
+        // for every deferred before we emit anything, so the first callback()
+        // call is always Bee Vidstream-2 regardless of network timing.
+        val results: List<ProviderResult> = coroutineScope {
+            providers.map { providerConfig ->
                 async {
                     try {
-                        // Resolve this provider's episode ID for the requested episode
-                        val resolvedId: String = if (epId != null && prov == providers.first()) {
-                            epId  // use the id we already have from load()
-                        } else {
-                            // Re-fetch episode list from this provider
-                            val epRes = app.get(
-                                "$CONSUMET/meta/anilist/info/$anilistId",
-                                params = mapOf("provider" to prov)
-                            )
-                            val epInfo = AppUtils.parseJson<CInfo>(epRes.text)
-                            val epList = epInfo.episodes ?: return@async ProvResult(emptyList(), emptyList())
-                            epList.firstOrNull { ep ->
-                                ep.number == epNum && (isDub == (ep.isDub == true))
-                            }?.id ?: return@async ProvResult(emptyList(), emptyList())
+                        // 1. Episode list
+                        val episodeList = fetchEpisodes(anilistId, providerConfig.id)
+                        if (episodeList.isEmpty()) return@async ProviderResult(emptyList(), emptyList())
+
+                        val episodeId = episodeList
+                            .firstOrNull { it.number == epNum }
+                            ?.id ?: return@async ProviderResult(emptyList(), emptyList())
+
+                        // 2. Sources query — kiwi and ally both use the basic 3 params
+                        val sourcesQuery: Map<String, Any> = mapOf(
+                            "episodeId" to episodeId,
+                            "provider"  to providerConfig.id,
+                            "category"  to providerConfig.category
+                        )
+
+                        val sourcesE = buildPipeParam("sources", sourcesQuery)
+                        val sourcesResponse = app.get(
+                            "$pipeUrl?e=$sourcesE",
+                            headers = mapOf("Referer" to "$mainUrl/", "Origin" to mainUrl)
+                        )
+
+                        val decoded = decodePipeResponse(sourcesResponse.text)
+                        val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
+
+                        // 3. Subtitles — deduplicate by language code
+                        val seenLangs  = mutableSetOf<String>()
+                        val subtitles  = mutableListOf<PendingSubtitle>()
+                        resp.subtitles?.forEach { sub ->
+                            if (!sub.file.isNullOrBlank()) {
+                                val key = sub.language ?: sub.label ?: "unknown"
+                                if (seenLangs.add(key)) {
+                                    subtitles.add(PendingSubtitle(
+                                        lang = sub.label ?: sub.language ?: "Unknown",
+                                        url  = sub.file
+                                    ))
+                                }
+                            }
                         }
 
-                        // Fetch streaming sources
-                        val srcRes = app.get(
-                            "$CONSUMET/meta/anilist/watch/$resolvedId",
-                            params = mapOf("provider" to prov)
-                        )
-                        val src = AppUtils.parseJson<CSources>(srcRes.text)
+                        // 4. Streams
+                        val streams = resp.streams ?: return@async ProviderResult(emptyList(), subtitles)
 
-                        val streams = src.sources
-                            ?.filter { !it.url.isNullOrBlank() }
-                            ?.map { s ->
-                                val label = buildString {
-                                    append("[")
-                                    append(prov.replaceFirstChar { it.uppercase() })
-                                    append("] ")
-                                    if (isDub) append("[DUB] ")
-                                    append(s.quality ?: "Auto")
-                                }
-                                PendingStream(label, s)
-                            } ?: emptyList()
+                        val toCollect: List<StreamItem> = when (providerConfig.id) {
+                            "kiwi" -> {
+                                // kiwi: isActive==true HLS first, then isActive==true embeds as fallback
+                                val activeHls   = streams.filter { it.type == "hls"   && it.isActive == true }
+                                val activeEmbed = streams.filter { it.type == "embed"  && it.isActive == true }
+                                activeHls + activeEmbed
+                            }
+                            "ally" -> {
+                                // ally: embed-only, sorted by priority ascending (1 = best)
+                                streams.filter { it.type == "embed" }
+                                    .sortedBy { it.priority ?: Int.MAX_VALUE }
+                            }
+                            else -> emptyList()
+                        }
 
-                        ProvResult(streams, src.subtitles ?: emptyList())
-                    } catch (_: Exception) {
-                        ProvResult(emptyList(), emptyList())
+                        if (toCollect.isEmpty()) return@async ProviderResult(emptyList(), subtitles)
+
+                        val pending = toCollect.map { stream ->
+                            val serverLabel = stream.fansub ?: stream.server ?: "Unknown"
+                            val qualityTag  = stream.quality ?: ""
+                            val linkName    = "${providerConfig.label} $serverLabel $qualityTag".trim()
+                            PendingStream(linkName, stream)
+                        }
+
+                        ProviderResult(pending, subtitles)
+
+                    } catch (ex: Exception) {
+                        ProviderResult(emptyList(), emptyList())
                     }
                 }
             }.awaitAll()
         }
 
-        // ── 3. Emit subtitles first (so player correlates before streams) ─────
-        val seenSubs = mutableSetOf<String>()
-        results.forEach { r ->
-            r.subtitles.forEach { sub ->
-                val url  = sub.url  ?: return@forEach
-                val lang = sub.lang ?: "Unknown"
-                if (lang.lowercase() == "thumbnails") return@forEach
-                if (seenSubs.add("$lang|$url")) {
-                    subtitleCallback(SubtitleFile(lang = lang, url = url))
+        // ── Emit in provider list order (kiwi → ally) ────────────────────────
+        // Subtitles first so CloudStream can correlate them before streams arrive
+        results.forEach { result ->
+            result.subtitles.forEach { sub ->
+                subtitleCallback(SubtitleFile(lang = sub.lang, url = sub.url))
+            }
+        }
+
+        results.forEach { result ->
+            result.streams.forEach { pending ->
+                if (pending.stream.type == "hls") {
+                    // HLS streams: emit directly with quality hint
+                    callback(
+                        newExtractorLink(
+                            source = name,
+                            name   = pending.linkName,
+                            url    = pending.stream.url,
+                            type   = ExtractorLinkType.M3U8
+                        ) {
+                            this.referer = pending.stream.referer ?: "$mainUrl/"
+                            this.quality = when (pending.stream.quality) {
+                                "1080p" -> Qualities.P1080.value
+                                "720p"  -> Qualities.P720.value
+                                "480p"  -> Qualities.P480.value
+                                "360p"  -> Qualities.P360.value
+                                else    -> Qualities.Unknown.value
+                            }
+                        }
+                    )
+                } else {
+                    // Embed streams (ally): hand off to CloudStream's
+                    // built-in extractor chain — handles ok.ru, mp4upload, etc.
+                    loadExtractor(
+                        url              = pending.stream.url,
+                        referer          = pending.stream.referer ?: "$mainUrl/",
+                        subtitleCallback = subtitleCallback,
+                        callback         = callback
+                    )
                 }
             }
         }
 
-        // ── 4. Emit stream links ──────────────────────────────────────────────
-        var anyEmitted = false
-        results.forEach { r ->
-            r.streams.forEach { pending ->
-                val url = pending.stream.url ?: return@forEach
-                if (pending.stream.isM3U8 == true || url.contains(".m3u8")) {
-                    callback(newExtractorLink(
-                        source = name,
-                        name   = pending.name,
-                        url    = url,
-                        type   = ExtractorLinkType.M3U8
-                    ) {
-                        referer = "$mainUrl/"
-                        quality = when {
-                            pending.stream.quality?.contains("1080") == true -> Qualities.P1080.value
-                            pending.stream.quality?.contains("720")  == true -> Qualities.P720.value
-                            pending.stream.quality?.contains("480")  == true -> Qualities.P480.value
-                            pending.stream.quality?.contains("360")  == true -> Qualities.P360.value
-                            else -> Qualities.Unknown.value
-                        }
-                    })
-                    anyEmitted = true
-                } else {
-                    // Embed URL (ok.ru, mp4upload, etc.) — hand to extractor chain
-                    loadExtractor(url, "$mainUrl/", subtitleCallback, callback)
-                    anyEmitted = true
-                }
-            }
-        }
-        return anyEmitted
+        return results.any { it.streams.isNotEmpty() }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // DATA CLASSES
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    // ── Paged response (advanced-search, trending, popular, etc.) ────────────
-    data class CPage(
-        val currentPage: Int?,
-        val hasNextPage: Boolean?,
-        val results: List<CMedia>?
+    // ─── DATA CLASSES: Schedule API ───────────────────────────────
+    data class ScheduleItem(
+        val episode: Int,
+        val airingAt: Long,
+        val timeUntilAiring: Long,
+        val media: BrowseMedia
     )
 
-    // ── Lightweight media object (search / browse results) ───────────────────
-    data class CMedia(
-        val id:          Any?,   // Int or String depending on endpoint
-        val title:       CTitle?,
-        val image:       String?,
-        val rating:      Int?,
-        val format:      String?,
-        val type:        String?,
-        val totalEpisodes: Int?,
-        val status:      String?,
-        val releaseDate: String?
+    // ─── DATA CLASSES: Browse/Search API ─────────────────────────
+    data class BrowseMedia(
+        val id: Int,
+        val idMal: Int?,
+        val title: BrowseTitle,
+        val coverImage: BrowseCoverImage,
+        val bannerImage: String?,
+        val format: String?,
+        val status: String?,
+        val episodes: Int?,
+        val averageScore: Int?,
+        val popularity: Int?,
+        val genres: List<String>?,
+        val type: String?,
+        val isAdult: Boolean?,
+        val nextAiringEpisode: BrowseNextAiring?,
+        val dubLanguages: List<String>?
     )
 
-    // ── Full info object returned by /meta/anilist/info/{id} ─────────────────
-    data class CInfo(
-        val id:          Any?,
-        val malId:       Int?,
-        val title:       CTitle?,
-        val image:       String?,
-        val cover:       String?,
-        val description: String?,
-        val rating:      Int?,
-        val type:        String?,
-        val format:      String?,
-        val status:      String?,
-        val releaseDate: String?,
-        val totalEpisodes: Int?,
-        val currentEpisode: Int?,
-        val genres:      List<String>?,
-        val episodes:    List<CEpisode>?,
-        val nextAiringEpisode: CNextAiring?,
-        // "dubDubbed" is returned by some provider mappings
-        val isDubbed:    Boolean?
-    )
-
-    data class CTitle(
-        val romaji:        String?,
-        val english:       String?,
-        val native:        String?,
+    data class BrowseTitle(
+        val native: String?,
+        val romaji: String?,
+        val english: String?,
         val userPreferred: String?
     )
 
-    data class CNextAiring(val episode: Int?, val airingAt: Long?)
-
-    // ── Episode object inside /info or /episodes ──────────────────────────────
-    data class CEpisode(
-        val id:          String,
-        val number:      Int,
-        val title:       String?,
-        val description: String?,
-        val image:       String?,
-        val airDate:     String?,
-        val isFiller:    Boolean?,
-        // zoro sets this to true for dub episodes in the same list
-        val isDub:       Boolean?
+    data class BrowseCoverImage(
+        val color: String?,
+        val large: String?,
+        val medium: String?,
+        val extraLarge: String?
     )
 
-    // ── Sources response from /meta/anilist/watch/{id} ────────────────────────
-    data class CSources(
-        val headers:   Map<String, String>?,
-        val sources:   List<CSource>?,
-        val subtitles: List<CSubtitle>?,
-        val intro:     CTimestamp?,
-        val outro:     CTimestamp?,
+    data class BrowseNextAiring(
+        val episode: Int?,
+        val airingAt: Long?,
+        val timeUntilAiring: Long?
+    )
+
+    // ─── DATA CLASSES: AniList (search + load) ───────────────────
+    data class AnilistSearchResponse(val data: SearchData)
+    data class SearchData(@JsonProperty("Page") val page: PageData)
+    data class PageData(val media: List<AnilistMedia>)
+    data class AnilistMedia(
+        val id: Int,
+        val title: TitleData,
+        val coverImage: CoverData,
+        val format: String?,
+        val episodes: Int?,
+        val status: String?
+    )
+
+    data class AnilistLoadResponse(val data: LoadData)
+    data class LoadData(@JsonProperty("Media") val media: MediaDetail)
+    data class MediaDetail(
+        val id: Int,
+        val title: TitleData,
+        val description: String?,
+        val coverImage: CoverData,
+        val bannerImage: String?,
+        val episodes: Int?,
+        val format: String?,
+        val genres: List<String>?,
+        val averageScore: Int?,
+        val status: String?,
+        val season: String?,
+        val seasonYear: Int?,
+        val studios: StudiosData?,
+        val nextAiringEpisode: NextAiringEpisode?
+    )
+
+    data class StudiosData(val nodes: List<StudioNode>?)
+    data class StudioNode(val name: String?)
+    data class NextAiringEpisode(val episode: Int?)
+    data class TitleData(val romaji: String?, val english: String?)
+    data class CoverData(val large: String?)
+
+    // ─── DATA CLASSES: Pipe Episodes API ─────────────────────────
+    // The /episodes endpoint returns a "providers" object where each key
+    // is a provider name, and the value contains an "episodes" object
+    // with optional "sub" list.
+    data class PipeEpisodesResponse(val providers: ProvidersData?)
+    data class ProvidersData(
+        val kiwi: ProviderData?,
+        val ally: ProviderData?
+    )
+    data class ProviderData(val episodes: EpisodesData?)
+    data class EpisodesData(
+        val sub: List<EpisodeItem>?,
+        val dub: List<EpisodeItem>?
+    )
+    data class EpisodeItem(
+        val id: String,
+        val number: Int,
+        val title: String?,
+        val description: String?,
+        val image: String?,
+        val airDate: String?,
+        val duration: Int?,
+        val filler: Boolean?
+    )
+
+    // ─── DATA CLASSES: Pipe Sources API ──────────────────────────
+    // kiwi fields: fansub, isActive, quality
+    // ally fields: server, priority  (embed-only, no isActive)
+    // Both have:   url, type, referer
+    data class SourcesResponse(
+        val streams:   List<StreamItem>?,
+        val subtitles: List<SubtitleItem>?,
         val download:  String?
     )
-
-    data class CSource(
-        val url:    String?,
-        val isM3U8: Boolean?,
-        val quality: String?
+    data class StreamItem(
+        val url:      String,
+        val type:     String?,
+        val quality:  String?,
+        val audio:    String?,
+        // kiwi-style
+        val fansub:   String?,
+        val isActive: Boolean?,
+        // ally-style
+        val server:   String?,
+        val priority: Int?,
+        @JsonProperty("default")
+        val isDefault: Boolean?,
+        // shared
+        val referer:  String?
     )
-
-    data class CSubtitle(
-        val url:  String?,
-        val lang: String?
-    )
-
-    data class CTimestamp(val start: Double?, val end: Double?)
-
-    // ── AniSkip response ──────────────────────────────────────────────────────
-    // GET https://api.aniskip.com/v2/skip-times/{malId}/{ep}?types[]=op&types[]=ed
-    data class AniSkipResult(
-        val found:   Boolean?,
-        val results: List<AniSkipItem>?
-    )
-
-    data class AniSkipItem(
-        val interval: AniSkipInterval?,
-        val skipType: String?,       // "op" | "ed" | "mixed-op" | "mixed-ed" | "recap"
-        val skipId:   String?,
-        val episodeLength: Double?
-    )
-
-    data class AniSkipInterval(
-        val startTime: Double?,
-        val endTime:   Double?
+    data class SubtitleItem(
+        val file:     String?,
+        val label:    String?,
+        val kind:     String?,
+        @JsonProperty("default")
+        val isDefault: Boolean?,
+        val language: String?,
+        val format:   String?,
+        val encoding: String?
     )
 }
