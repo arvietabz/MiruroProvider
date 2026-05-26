@@ -5,6 +5,7 @@ import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import java.net.URLEncoder
 
 class AnimeNexusProvider : MainAPI() {
     override var mainUrl = "https://anime.nexus"
@@ -100,7 +101,6 @@ class AnimeNexusProvider : MainAPI() {
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        // Build URL with correct pagination param per endpoint type
         val url = when {
             request.data.contains("/latest") -> {
                 val base = request.data.substringBefore("?")
@@ -111,7 +111,6 @@ class AnimeNexusProvider : MainAPI() {
                 "$base?page=$page"
             }
             request.data.contains("/popular") -> {
-                // popular uses cursor pagination — just use page 1 for now
                 request.data
             }
             else -> request.data
@@ -128,9 +127,9 @@ class AnimeNexusProvider : MainAPI() {
     // ── Search ─────────────────────────────────────────────────────────────────
 
     override suspend fun search(query: String): List<SearchResponse> {
-        // TODO: confirm search endpoint from dev tools
-        // Likely: GET $apiUrl/api/anime/search?q={query}
-        val response = app.get("$apiUrl/api/anime/search?q=${query.encodeUri()}").text
+        // FIX: replaced non-existent encodeUri() with URLEncoder.encode()
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val response = app.get("$apiUrl/api/anime/search?q=$encoded").text
         val parsed = mapper.readValue<ListResponse>(response)
         return parsed.data?.map { showToSearchResponse(it) } ?: emptyList()
     }
@@ -138,19 +137,12 @@ class AnimeNexusProvider : MainAPI() {
     // ── Load (show detail page) ────────────────────────────────────────────────
 
     override suspend fun load(url: String): LoadResponse? {
-        // url = "$mainUrl/shows/{slug}"
         val slug = url.substringAfterLast("/")
 
-        // TODO: confirm show detail endpoint from dev tools
-        // Likely: GET $apiUrl/api/anime/{slug}
         val showResponse = app.get("$apiUrl/api/anime/$slug").text
         val show = mapper.readValue<Show>(showResponse)
 
-        // TODO: confirm episode list endpoint from dev tools
-        // Likely: GET $apiUrl/api/anime/{slug}/episodes
         val episodesResponse = app.get("$apiUrl/api/anime/$slug/episodes").text
-        // (parse episodes once you have the response shape)
-
         val episodes = listOf<com.lagradost.cloudstream3.Episode>() // placeholder
 
         return newAnimeLoadResponse(
@@ -177,11 +169,6 @@ class AnimeNexusProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        // data = episode id or slug passed from load()
-        // TODO: confirm sources endpoint from dev tools
-        // Likely: GET $apiUrl/api/episodes/{episode-id}/sources
-        // or:     GET $apiUrl/api/episodes/{episode-slug}/watch
-
         return false // placeholder until endpoint is confirmed
     }
 }
