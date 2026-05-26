@@ -23,14 +23,20 @@ class MiruroProvider : MainAPI() {
     private val pipeUrl = "$mainUrl/api/secure/pipe"
 
     // ─── PROVIDER CONFIG ──────────────────────────────────────────
-    // kiwi: HLS + embed pairs per quality; emit only isActive==true ones
-    // ally: embed-only streams (ok.ru, mp4upload, bysekoze, allanime)
     private val providers = listOf(
-        ProviderConfig("kiwi", "sub", "Kiwi"),
-        ProviderConfig("ally", "sub", "Ally")
+        ProviderConfig("bee",  "sub", "Bee",  hasSsub = true),
+        ProviderConfig("hop",  "sub", "Hop",  hasSsub = true),
+        ProviderConfig("dune", "sub", "Dune", hasSsub = true),
+        ProviderConfig("kiwi", "sub", "Kiwi", hasSsub = false),
+        ProviderConfig("ally", "sub", "Ally", hasSsub = false)
     )
 
-    data class ProviderConfig(val id: String, val category: String, val label: String)
+    data class ProviderConfig(
+        val id: String,
+        val category: String,
+        val label: String,
+        val hasSsub: Boolean
+    )
 
     // ─── HELPER: slugify ──────────────────────────────────────────
     private fun slugify(text: String): String {
@@ -101,7 +107,6 @@ class MiruroProvider : MainAPI() {
     }
 
     // ─── HELPER: fetch episode list for a given provider ──────────
-    // /episodes returns: { "providers": { "kiwi": { "episodes": { "sub": [...] } }, "ally": { ... } } }
     private suspend fun fetchEpisodes(anilistId: Int, provider: String): List<EpisodeItem> {
         return try {
             val decoded = pipeGet(
@@ -115,6 +120,9 @@ class MiruroProvider : MainAPI() {
                     when (provider) {
                         "kiwi" -> p.kiwi?.episodes
                         "ally" -> p.ally?.episodes
+                        "bee"  -> p.bee?.episodes
+                        "hop"  -> p.hop?.episodes
+                        "dune" -> p.dune?.episodes
                         else   -> null
                     }
                 }?.let { eps -> eps.sub }
@@ -285,7 +293,6 @@ class MiruroProvider : MainAPI() {
         val plot    = media.description?.replace(Regex("<.*?>"), "")
         val slug    = slugify(media.title.romaji ?: title)
 
-        // Use kiwi as the primary source for episode metadata (titles, thumbnails, etc.)
         val episodeData = fetchEpisodes(anilistId, "kiwi")
 
         val episodes = if (episodeData.isNotEmpty()) {
@@ -355,30 +362,26 @@ class MiruroProvider : MainAPI() {
         data class PendingSubtitle(val lang: String, val url: String)
         data class ProviderResult(
             val streams:   List<PendingStream>,
-            val subtitles: List<PendingSubtitle>
+            val subtitles: List<PendingSubtitle>,
+            val isSoft:    Boolean
         )
 
-        // ── Fetch all providers CONCURRENTLY, preserving list order ──────────
-        // coroutineScope launches each provider in parallel; awaitAll() waits
-        // for every deferred before we emit anything, so the first callback()
-        // call is always Bee Vidstream-2 regardless of network timing.
         val results: List<ProviderResult> = coroutineScope {
             providers.map { providerConfig ->
                 async {
                     try {
-                        // 1. Episode list
                         val episodeList = fetchEpisodes(anilistId, providerConfig.id)
-                        if (episodeList.isEmpty()) return@async ProviderResult(emptyList(), emptyList())
+                        if (episodeList.isEmpty()) return@async ProviderResult(emptyList(), emptyList(), false)
 
                         val episodeId = episodeList
                             .firstOrNull { it.number == epNum }
-                            ?.id ?: return@async ProviderResult(emptyList(), emptyList())
+                            ?.id ?: return@async ProviderResult(emptyList(), emptyList(), false)
 
-                        // 2. Sources query — kiwi and ally both use the basic 3 params
                         val sourcesQuery: Map<String, Any> = mapOf(
                             "episodeId" to episodeId,
                             "provider"  to providerConfig.id,
-                            "category"  to providerConfig.category
+                            "category"  to providerConfig.category,
+                            "anilistId" to anilistId
                         )
 
                         val sourcesE = buildPipeParam("sources", sourcesQuery)
@@ -390,13 +393,33 @@ class MiruroProvider : MainAPI() {
                         val decoded = decodePipeResponse(sourcesResponse.text)
                         val resp    = AppUtils.parseJson<SourcesResponse>(decoded)
 
-                        // 3. Subtitles — deduplicate by language code
-                        val seenLangs  = mutableSetOf<String>()
-                        val subtitles  = mutableListOf<PendingSubtitle>()
-                        resp.subtitles?.forEach { sub ->
+                        // ── Resolve block: prefer ssub > hsub > flat ───────
+                        val (rawStreams, rawSubtitles, isSoft) = when {
+                            resp.ssub?.streams?.isNotEmpty() == true -> Triple(
+                                resp.ssub.streams,
+                                resp.ssub.subtitles,
+                                true
+                            )
+                            resp.hsub?.streams?.isNotEmpty() == true -> Triple(
+                                resp.hsub.streams,
+                                resp.hsub.subtitles,
+                                false
+                            )
+                            resp.streams?.isNotEmpty() == true -> Triple(
+                                resp.streams,
+                                resp.subtitles,
+                                false
+                            )
+                            else -> return@async ProviderResult(emptyList(), emptyList(), false)
+                        }
+
+                        // ── Deduplicate subtitles by filename ─────────────
+                        val seenFiles = mutableSetOf<String>()
+                        val subtitles = mutableListOf<PendingSubtitle>()
+                        rawSubtitles?.forEach { sub ->
                             if (!sub.file.isNullOrBlank()) {
-                                val key = sub.language ?: sub.label ?: "unknown"
-                                if (seenLangs.add(key)) {
+                                val filename = sub.file.substringAfterLast("/")
+                                if (seenFiles.add(filename)) {
                                     subtitles.add(PendingSubtitle(
                                         lang = sub.label ?: sub.language ?: "Unknown",
                                         url  = sub.file
@@ -405,54 +428,67 @@ class MiruroProvider : MainAPI() {
                             }
                         }
 
-                        // 4. Streams
-                        val streams = resp.streams ?: return@async ProviderResult(emptyList(), subtitles)
+                        // ── Move English to front of subtitle list ─────────
+                        val reordered = run {
+                            val engTrack = subtitles.firstOrNull {
+                                it.lang.lowercase().contains("english") ||
+                                it.lang.lowercase() == "en"
+                            }
+                            if (engTrack != null) {
+                                listOf(engTrack) + subtitles.filter { it !== engTrack }
+                            } else subtitles
+                        }
 
+                        // ── Build stream list ──────────────────────────────
                         val toCollect: List<StreamItem> = when (providerConfig.id) {
                             "kiwi" -> {
-                                // kiwi: isActive==true HLS first, then isActive==true embeds as fallback
-                                val activeHls   = streams.filter { it.type == "hls"   && it.isActive == true }
-                                val activeEmbed = streams.filter { it.type == "embed"  && it.isActive == true }
+                                val activeHls   = rawStreams.filter { it.type == "hls"  && it.isActive == true }
+                                val activeEmbed = rawStreams.filter { it.type == "embed" && it.isActive == true }
                                 activeHls + activeEmbed
                             }
+                            "bee", "hop", "dune" -> {
+                                val hls   = rawStreams.filter { it.type == "hls" }
+                                val embed = rawStreams.filter { it.type == "embed" }
+                                hls + embed
+                            }
                             "ally" -> {
-                                // ally: embed-only, sorted by priority ascending (1 = best)
-                                streams.filter { it.type == "embed" }
+                                rawStreams.filter { it.type == "embed" }
                                     .sortedBy { it.priority ?: Int.MAX_VALUE }
                             }
                             else -> emptyList()
                         }
 
-                        if (toCollect.isEmpty()) return@async ProviderResult(emptyList(), subtitles)
+                        if (toCollect.isEmpty()) return@async ProviderResult(emptyList(), reordered, isSoft)
 
                         val pending = toCollect.map { stream ->
-                            val serverLabel = stream.fansub ?: stream.server ?: "Unknown"
+                            val serverLabel = stream.fansub ?: stream.server ?: "Stream"
                             val qualityTag  = stream.quality ?: ""
-                            val linkName    = "${providerConfig.label} $serverLabel $qualityTag".trim()
+                            val softTag     = if (isSoft) "[S]" else ""
+                            val linkName    = "${providerConfig.label} $serverLabel $qualityTag $softTag".trim()
                             PendingStream(linkName, stream)
                         }
 
-                        ProviderResult(pending, subtitles)
+                        ProviderResult(pending, reordered, isSoft)
 
                     } catch (ex: Exception) {
-                        ProviderResult(emptyList(), emptyList())
+                        ProviderResult(emptyList(), emptyList(), false)
                     }
                 }
             }.awaitAll()
         }
 
-        // ── Emit in provider list order (kiwi → ally) ────────────────────────
-        // Subtitles first so CloudStream can correlate them before streams arrive
-        results.forEach { result ->
+        // ── Soft-sub results first, then hard-sub ─────────────────
+        val sorted = results.sortedByDescending { it.isSoft }
+
+        sorted.forEach { result ->
             result.subtitles.forEach { sub ->
                 subtitleCallback(SubtitleFile(lang = sub.lang, url = sub.url))
             }
         }
 
-        results.forEach { result ->
+        sorted.forEach { result ->
             result.streams.forEach { pending ->
                 if (pending.stream.type == "hls") {
-                    // HLS streams: emit directly with quality hint
                     callback(
                         newExtractorLink(
                             source = name,
@@ -471,8 +507,6 @@ class MiruroProvider : MainAPI() {
                         }
                     )
                 } else {
-                    // Embed streams (ally): hand off to CloudStream's
-                    // built-in extractor chain — handles ok.ru, mp4upload, etc.
                     loadExtractor(
                         url              = pending.stream.url,
                         referer          = pending.stream.referer ?: "$mainUrl/",
@@ -483,7 +517,7 @@ class MiruroProvider : MainAPI() {
             }
         }
 
-        return results.any { it.streams.isNotEmpty() }
+        return sorted.any { it.streams.isNotEmpty() }
     }
 
     // ─── DATA CLASSES: Schedule API ───────────────────────────────
@@ -572,13 +606,13 @@ class MiruroProvider : MainAPI() {
     data class CoverData(val large: String?)
 
     // ─── DATA CLASSES: Pipe Episodes API ─────────────────────────
-    // The /episodes endpoint returns a "providers" object where each key
-    // is a provider name, and the value contains an "episodes" object
-    // with optional "sub" list.
     data class PipeEpisodesResponse(val providers: ProvidersData?)
     data class ProvidersData(
         val kiwi: ProviderData?,
-        val ally: ProviderData?
+        val ally: ProviderData?,
+        val bee:  ProviderData?,
+        val hop:  ProviderData?,
+        val dune: ProviderData?
     )
     data class ProviderData(val episodes: EpisodesData?)
     data class EpisodesData(
@@ -597,30 +631,42 @@ class MiruroProvider : MainAPI() {
     )
 
     // ─── DATA CLASSES: Pipe Sources API ──────────────────────────
-    // kiwi fields: fansub, isActive, quality
-    // ally fields: server, priority  (embed-only, no isActive)
-    // Both have:   url, type, referer
     data class SourcesResponse(
         val streams:   List<StreamItem>?,
         val subtitles: List<SubtitleItem>?,
-        val download:  String?
+        val download:  String?,
+        val ssub:      SsubBlock?,
+        val hsub:      SsubBlock?
     )
+
+    data class SsubBlock(
+        val streams:   List<StreamItem>?,
+        val subtitles: List<SubtitleItem>?,
+        val provider:  String?,
+        val thumbnail: String?
+    )
+
     data class StreamItem(
         val url:      String,
         val type:     String?,
         val quality:  String?,
         val audio:    String?,
-        // kiwi-style
         val fansub:   String?,
         val isActive: Boolean?,
-        // ally-style
         val server:   String?,
         val priority: Int?,
         @JsonProperty("default")
         val isDefault: Boolean?,
-        // shared
-        val referer:  String?
+        val referer:  String?,
+        val codec:    String?,
+        val resolution: ResolutionItem?
     )
+
+    data class ResolutionItem(
+        val width:  Int?,
+        val height: Int?
+    )
+
     data class SubtitleItem(
         val file:     String?,
         val label:    String?,
