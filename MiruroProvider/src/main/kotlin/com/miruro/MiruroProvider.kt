@@ -286,13 +286,13 @@ class MiruroProvider : MainAPI() {
     // ══════════════════════════════════════════════════════════════
 
     override val mainPage = mainPageOf(
-        "spotlight" to "Spotlight",
+        "recent"    to "Recently Aired",
         "trending"  to "Trending Now",
+        "finished"  to "Recently Finished",
+        "spotlight" to "Spotlight",
         "popular"   to "All-Time Popular",
         "upcoming"  to "Upcoming",
-        "recent"    to "Airing Now",
         "schedule"  to "Airing Schedule",
-        "finished"  to "Recently Finished",
         "movies"    to "Movies"
     )
 
