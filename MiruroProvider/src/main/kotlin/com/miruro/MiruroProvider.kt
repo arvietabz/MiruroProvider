@@ -22,7 +22,7 @@ class MiruroProvider : MainAPI() {
     private val anilistUrl = "https://graphql.anilist.co"
     private val pipeUrl = "$mainUrl/api/secure/pipe"
 
-    // ─── PROVIDER CONFIG ──────────────────────────────────────────
+    // ─── PROVIDER CONFIG (episode/source providers behind the pipe) ──
     private val providers = listOf(
         ProviderConfig("bee",  "sub", "Bee",  hasSsub = true),
         ProviderConfig("hop",  "sub", "Hop",  hasSsub = true),
@@ -38,6 +38,108 @@ class MiruroProvider : MainAPI() {
         val hasSsub: Boolean
     )
 
+    // ══════════════════════════════════════════════════════════════
+    //  ANILIST — GraphQL fragments (mirrors api.py's MEDIA_LIST_FIELDS
+    //  and MEDIA_FULL_FIELDS, using real variables instead of string
+    //  interpolation to avoid query-injection on search terms)
+    // ══════════════════════════════════════════════════════════════
+
+    private val mediaListFields = """
+        id
+        title { romaji english native }
+        coverImage { large extraLarge }
+        bannerImage
+        format
+        season
+        seasonYear
+        episodes
+        duration
+        status
+        averageScore
+        meanScore
+        popularity
+        favourites
+        genres
+        source
+        countryOfOrigin
+        isAdult
+        studios(isMain: true) { nodes { name isAnimationStudio } }
+        nextAiringEpisode { episode airingAt timeUntilAiring }
+        startDate { year month day }
+        endDate { year month day }
+    """.trimIndent()
+
+    private val mediaFullFields = """
+        id
+        idMal
+        title { romaji english native }
+        description(asHtml: false)
+        coverImage { large extraLarge color }
+        bannerImage
+        format
+        season
+        seasonYear
+        episodes
+        duration
+        status
+        averageScore
+        meanScore
+        popularity
+        favourites
+        genres
+        tags { name rank isMediaSpoiler }
+        source
+        countryOfOrigin
+        isAdult
+        synonyms
+        siteUrl
+        trailer { id site thumbnail }
+        studios { nodes { name isAnimationStudio } }
+        nextAiringEpisode { episode airingAt timeUntilAiring }
+        startDate { year month day }
+        endDate { year month day }
+        characters(sort: [ROLE, RELEVANCE], perPage: 25) {
+            edges {
+                role
+                node { name { full native } image { large } }
+                voiceActors(language: JAPANESE) { name { full native } image { large } }
+            }
+        }
+        relations {
+            edges {
+                relationType(version: 2)
+                node {
+                    id
+                    title { romaji english }
+                    coverImage { large }
+                    format
+                    type
+                    status
+                }
+            }
+        }
+        recommendations(sort: RATING_DESC, perPage: 10) {
+            nodes {
+                mediaRecommendation {
+                    id
+                    title { romaji english }
+                    coverImage { large }
+                    format
+                }
+            }
+        }
+    """.trimIndent()
+
+    // ─── HELPER: run an AniList GraphQL query with real variables ─
+    private suspend fun anilistQuery(query: String, variables: Map<String, Any?> = emptyMap()): String {
+        val response = app.post(
+            anilistUrl,
+            json = mapOf("query" to query, "variables" to variables),
+            headers = mapOf("Content-Type" to "application/json")
+        )
+        return response.text
+    }
+
     // ─── HELPER: slugify ──────────────────────────────────────────
     private fun slugify(text: String): String {
         return text.lowercase()
@@ -46,28 +148,19 @@ class MiruroProvider : MainAPI() {
             .replace(Regex("\\s+"), "-")
     }
 
-    // ─── HELPER: BrowseMedia → SearchResponse ─────────────────────
-    private fun BrowseMedia.toSearchResult(isMovie: Boolean = format == "MOVIE"): SearchResponse? {
+    // ─── HELPER: AnilistMedia → SearchResponse ────────────────────
+    private fun AnilistMedia.toSearchResult(): SearchResponse? {
         val titleStr = title.english ?: title.romaji ?: return null
         val slug     = slugify(titleStr)
         val watchUrl = "$mainUrl/watch/$id/$slug"
+        val isMovie  = format == "MOVIE"
         val tvType   = if (isMovie) TvType.AnimeMovie else TvType.Anime
         return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
             posterUrl = coverImage.large
         }
     }
 
-    // ─── HELPER: AnilistMedia → SearchResponse ────────────────────
-    private fun AnilistMedia.toSearchResult(): SearchResponse? {
-        val titleStr = title.english ?: title.romaji ?: return null
-        val slug     = slugify(titleStr)
-        val watchUrl = "$mainUrl/watch/$id/$slug"
-        return newAnimeSearchResponse(titleStr, watchUrl, TvType.Anime) {
-            posterUrl = coverImage.large
-        }
-    }
-
-    // ─── HELPER: build pipe payload ───────────────────────────────
+    // ─── HELPER: build pipe payload (unchanged pipe protocol) ─────
     private fun buildPipeParam(path: String, query: Map<String, Any>): String {
         val payload = """{"path":"$path","method":"GET","query":${
             query.entries.joinToString(",", "{", "}") { (k, v) ->
@@ -85,7 +178,7 @@ class MiruroProvider : MainAPI() {
         )
     }
 
-    // ─── HELPER: decode pipe response ─────────────────────────────
+    // ─── HELPER: decode pipe response (base64 + gzip, unchanged) ──
     private fun decodePipeResponse(text: String): String {
         val bytes = Base64.decode(text, Base64.URL_SAFE)
         return GZIPInputStream(ByteArrayInputStream(bytes))
@@ -134,7 +227,13 @@ class MiruroProvider : MainAPI() {
         }
     }
 
-    // ─── MAIN PAGE ────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  MAIN PAGE — mirrors api.py's /trending, /schedule, /filter
+    //  (status=FINISHED) and /filter (format=MOVIE) endpoints, all
+    //  hitting AniList directly instead of Miruro's undocumented
+    //  internal search/browse pipe path.
+    // ══════════════════════════════════════════════════════════════
+
     override val mainPage = mainPageOf(
         "recently_updated"  to "Recently Updated",
         "trending_now"      to "Trending Now",
@@ -145,79 +244,68 @@ class MiruroProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val home: List<SearchResponse> = when (request.data) {
 
+            // ── mirrors /schedule: airingSchedules(notYetAired: true) ──
             "recently_updated" -> {
-                val now     = System.currentTimeMillis() / 1000
-                val weekAgo = now - 7 * 24 * 3600
-                val weekEnd = now + 7 * 24 * 3600
-                val startAt = (weekAgo / 86400) * 86400
-                val endAt   = (weekEnd / 86400) * 86400
-
-                val decoded = pipeGet(
-                    "schedule",
-                    mapOf(
-                        "startAt" to startAt,
-                        "endAt"   to endAt,
-                        "sort"    to listOf("TIME_DESC")
-                    )
-                )
-                val items = AppUtils.parseJson<List<ScheduleItem>>(decoded)
-                items
-                    .distinctBy { it.media.id }
-                    .mapNotNull { it.media.toSearchResult() }
+                val gql = """
+                    query (${'$'}page: Int, ${'$'}perPage: Int) {
+                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                            airingSchedules(notYetAired: true, sort: TIME) {
+                                media { $mediaListFields }
+                            }
+                        }
+                    }
+                """.trimIndent()
+                val text = anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
+                AppUtils.parseJson<AnilistScheduleResponse>(text)
+                    .data.page.airingSchedules
+                    .map { it.media }
+                    .distinctBy { it.id }
+                    .mapNotNull { it.toSearchResult() }
             }
 
+            // ── mirrors /trending: sort TRENDING_DESC ───────────────
             "trending_now" -> {
-                val decoded = pipeGet(
-                    "search/browse",
-                    mapOf(
-                        "type"    to "ANIME",
-                        "status"  to "RELEASING",
-                        "sort"    to "TRENDING_DESC",
-                        "page"    to page,
-                        "perPage" to 20
-                    )
-                )
-                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                val gql = """
+                    query (${'$'}page: Int, ${'$'}perPage: Int) {
+                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                            media(type: ANIME, sort: [TRENDING_DESC]) { $mediaListFields }
+                        }
+                    }
+                """.trimIndent()
+                val text = anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
+                AppUtils.parseJson<AnilistCollectionResponse>(text)
+                    .data.page.media
                     .mapNotNull { it.toSearchResult() }
             }
 
+            // ── mirrors /filter?status=FINISHED&sort=TRENDING_DESC ──
             "recently_finished" -> {
-                val sixMonthsAgo = run {
-                    val cal = java.util.Calendar.getInstance()
-                    cal.add(java.util.Calendar.MONTH, -6)
-                    val y = cal.get(java.util.Calendar.YEAR)
-                    val m = cal.get(java.util.Calendar.MONTH) + 1
-                    val d = cal.get(java.util.Calendar.DAY_OF_MONTH)
-                    y * 10000 + m * 100 + d
-                }
-                val decoded = pipeGet(
-                    "search/browse",
-                    mapOf(
-                        "type"            to "ANIME",
-                        "status"          to "FINISHED",
-                        "sort"            to "TRENDING_DESC",
-                        "endDate_greater" to sixMonthsAgo,
-                        "page"            to page,
-                        "perPage"         to 20
-                    )
-                )
-                AppUtils.parseJson<List<BrowseMedia>>(decoded)
+                val gql = """
+                    query (${'$'}page: Int, ${'$'}perPage: Int) {
+                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                            media(type: ANIME, status: FINISHED, sort: [TRENDING_DESC]) { $mediaListFields }
+                        }
+                    }
+                """.trimIndent()
+                val text = anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
+                AppUtils.parseJson<AnilistCollectionResponse>(text)
+                    .data.page.media
                     .mapNotNull { it.toSearchResult() }
             }
 
+            // ── mirrors /filter?format=MOVIE&sort=SCORE_DESC ────────
             "top_movies" -> {
-                val offset  = (page - 1) * 20
-                val decoded = pipeGet(
-                    "search",
-                    mapOf(
-                        "format" to "MOVIE",
-                        "sort"   to "SCORE_DESC",
-                        "limit"  to 20,
-                        "offset" to offset
-                    )
-                )
-                AppUtils.parseJson<List<BrowseMedia>>(decoded)
-                    .mapNotNull { it.toSearchResult(isMovie = true) }
+                val gql = """
+                    query (${'$'}page: Int, ${'$'}perPage: Int) {
+                        Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                            media(type: ANIME, format: MOVIE, sort: [SCORE_DESC]) { $mediaListFields }
+                        }
+                    }
+                """.trimIndent()
+                val text = anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
+                AppUtils.parseJson<AnilistCollectionResponse>(text)
+                    .data.page.media
+                    .mapNotNull { it.toSearchResult() }
             }
 
             else -> emptyList()
@@ -229,65 +317,47 @@ class MiruroProvider : MainAPI() {
         )
     }
 
-    // ─── SEARCH ───────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  SEARCH — mirrors api.py's /search (sort: SEARCH_MATCH, real
+    //  GraphQL variables instead of interpolating the raw query)
+    // ══════════════════════════════════════════════════════════════
+
     override suspend fun search(query: String): List<SearchResponse> {
-        val graphqlQuery = """
-            query {
-              Page(perPage: 20) {
-                media(search: "$query", type: ANIME, isAdult: false) {
-                  id
-                  title { romaji english }
-                  coverImage { large }
-                  format
-                  episodes
-                  status
+        val gql = """
+            query (${'$'}search: String, ${'$'}page: Int, ${'$'}perPage: Int) {
+                Page(page: ${'$'}page, perPage: ${'$'}perPage) {
+                    media(search: ${'$'}search, type: ANIME, sort: SEARCH_MATCH, isAdult: false) {
+                        $mediaListFields
+                    }
                 }
-              }
             }
         """.trimIndent()
 
-        val response = app.post(
-            anilistUrl,
-            json    = mapOf("query" to graphqlQuery),
-            headers = mapOf("Content-Type" to "application/json")
-        )
-
-        return AppUtils.parseJson<AnilistSearchResponse>(response.text)
+        val text = anilistQuery(gql, mapOf("search" to query, "page" to 1, "perPage" to 20))
+        return AppUtils.parseJson<AnilistCollectionResponse>(text)
             .data.page.media
             .mapNotNull { it.toSearchResult() }
     }
 
-    // ─── LOAD ─────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  LOAD — mirrors api.py's /info/{id} (full field set: tags,
+    //  studios, characters/voice actors, relations, recommendations)
+    // ══════════════════════════════════════════════════════════════
+
     override suspend fun load(url: String): LoadResponse {
         val anilistId = url.split("/")[4].toInt()
 
-        val graphqlQuery = """
-            query {
-              Media(id: $anilistId, type: ANIME) {
-                id
-                title { romaji english }
-                description
-                coverImage { large }
-                bannerImage
-                episodes
-                format
-                genres
-                averageScore
-                status
-                season
-                seasonYear
-                studios { nodes { name } }
-                nextAiringEpisode { episode }
-              }
+        val gql = """
+            query (${'$'}id: Int) {
+                Media(id: ${'$'}id, type: ANIME) {
+                    $mediaFullFields
+                }
             }
         """.trimIndent()
 
-        val anilistResponse = app.post(
-            anilistUrl,
-            json    = mapOf("query" to graphqlQuery),
-            headers = mapOf("Content-Type" to "application/json")
-        )
-        val media   = AppUtils.parseJson<AnilistLoadResponse>(anilistResponse.text).data.media
+        val text  = anilistQuery(gql, mapOf("id" to anilistId))
+        val media = AppUtils.parseJson<AnilistLoadResponse>(text).data.media
+
         val title   = media.title.english ?: media.title.romaji ?: "Unknown"
         val isMovie = media.format == "MOVIE"
         val plot    = media.description?.replace(Regex("<.*?>"), "")
@@ -319,6 +389,29 @@ class MiruroProvider : MainAPI() {
             }
         }
 
+        val actorList = media.characters?.edges?.mapNotNull { edge ->
+            val charName = edge.node?.name?.full ?: return@mapNotNull null
+            val vaName   = edge.voiceActors?.firstOrNull()?.name?.full
+            ActorData(
+                actor = Actor(charName, edge.node.image?.large),
+                roleString = vaName
+            )
+        }
+
+        val recommendationList = media.recommendations?.nodes
+            ?.mapNotNull { it.mediaRecommendation }
+            ?.mapNotNull { rec ->
+                val recTitle = rec.title.english ?: rec.title.romaji ?: return@mapNotNull null
+                val recSlug  = slugify(recTitle)
+                newAnimeSearchResponse(
+                    recTitle,
+                    "$mainUrl/watch/${rec.id}/$recSlug",
+                    if (rec.format == "MOVIE") TvType.AnimeMovie else TvType.Anime
+                ) {
+                    posterUrl = rec.coverImage?.large
+                }
+            }
+
         return if (isMovie) {
             newMovieLoadResponse(
                 name    = title,
@@ -331,6 +424,8 @@ class MiruroProvider : MainAPI() {
                 this.plot           = plot
                 tags                = media.genres
                 score               = Score.from100(media.averageScore)
+                this.actors         = actorList
+                this.recommendations = recommendationList
             }
         } else {
             newAnimeLoadResponse(
@@ -343,12 +438,19 @@ class MiruroProvider : MainAPI() {
                 this.plot           = plot
                 tags                = media.genres
                 score               = Score.from100(media.averageScore)
+                this.actors         = actorList
+                this.recommendations = recommendationList
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
     }
 
-    // ─── LOAD LINKS ───────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    //  LOAD LINKS — unchanged: same pipe protocol api.py's
+    //  /episodes + /sources use internally (base64+gzip request/
+    //  response over Miruro's /api/secure/pipe)
+    // ══════════════════════════════════════════════════════════════
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -520,92 +622,98 @@ class MiruroProvider : MainAPI() {
         return sorted.any { it.streams.isNotEmpty() }
     }
 
-    // ─── DATA CLASSES: Schedule API ───────────────────────────────
-    data class ScheduleItem(
-        val episode: Int,
-        val airingAt: Long,
-        val timeUntilAiring: Long,
-        val media: BrowseMedia
-    )
+    // ══════════════════════════════════════════════════════════════
+    //  DATA CLASSES — AniList (mirrors MEDIA_LIST_FIELDS / _FULL_FIELDS)
+    // ══════════════════════════════════════════════════════════════
 
-    // ─── DATA CLASSES: Browse/Search API ─────────────────────────
-    data class BrowseMedia(
+    data class AnilistTitle(val romaji: String?, val english: String?, val native: String? = null)
+    data class AnilistCoverImage(val large: String?, val extraLarge: String? = null, val color: String? = null)
+    data class AnilistStudioNode(val name: String?, val isAnimationStudio: Boolean? = null)
+    data class AnilistStudios(val nodes: List<AnilistStudioNode>?)
+    data class AnilistNextAiring(val episode: Int?, val airingAt: Long?, val timeUntilAiring: Long?)
+    data class AnilistFuzzyDate(val year: Int?, val month: Int?, val day: Int?)
+    data class AnilistTag(val name: String?, val rank: Int?, val isMediaSpoiler: Boolean?)
+    data class AnilistName(val full: String?, val native: String?)
+    data class AnilistImage(val large: String?)
+
+    data class AnilistCharacterNode(val name: AnilistName?, val image: AnilistImage?)
+    data class AnilistVoiceActor(val name: AnilistName?, val image: AnilistImage?)
+    data class AnilistCharacterEdge(
+        val role: String?,
+        val node: AnilistCharacterNode?,
+        val voiceActors: List<AnilistVoiceActor>?
+    )
+    data class AnilistCharacters(val edges: List<AnilistCharacterEdge>?)
+
+    data class AnilistRelatedMedia(
         val id: Int,
-        val idMal: Int?,
-        val title: BrowseTitle,
-        val coverImage: BrowseCoverImage,
-        val bannerImage: String?,
+        val title: AnilistTitle,
+        val coverImage: AnilistCoverImage?,
         val format: String?,
-        val status: String?,
-        val episodes: Int?,
-        val averageScore: Int?,
-        val popularity: Int?,
-        val genres: List<String>?,
         val type: String?,
-        val isAdult: Boolean?,
-        val nextAiringEpisode: BrowseNextAiring?,
-        val dubLanguages: List<String>?
-    )
-
-    data class BrowseTitle(
-        val native: String?,
-        val romaji: String?,
-        val english: String?,
-        val userPreferred: String?
-    )
-
-    data class BrowseCoverImage(
-        val color: String?,
-        val large: String?,
-        val medium: String?,
-        val extraLarge: String?
-    )
-
-    data class BrowseNextAiring(
-        val episode: Int?,
-        val airingAt: Long?,
-        val timeUntilAiring: Long?
-    )
-
-    // ─── DATA CLASSES: AniList (search + load) ───────────────────
-    data class AnilistSearchResponse(val data: SearchData)
-    data class SearchData(@JsonProperty("Page") val page: PageData)
-    data class PageData(val media: List<AnilistMedia>)
-    data class AnilistMedia(
-        val id: Int,
-        val title: TitleData,
-        val coverImage: CoverData,
-        val format: String?,
-        val episodes: Int?,
         val status: String?
     )
+    data class AnilistRelationEdge(val relationType: String?, val node: AnilistRelatedMedia?)
+    data class AnilistRelations(val edges: List<AnilistRelationEdge>?)
 
-    data class AnilistLoadResponse(val data: LoadData)
-    data class LoadData(@JsonProperty("Media") val media: MediaDetail)
-    data class MediaDetail(
+    data class AnilistRecommendationNode(val mediaRecommendation: AnilistRelatedMedia?)
+    data class AnilistRecommendations(val nodes: List<AnilistRecommendationNode>?)
+
+    data class AnilistTrailer(val id: String?, val site: String?, val thumbnail: String?)
+
+    // Media shape used across search / collection / schedule (MEDIA_LIST_FIELDS)
+    data class AnilistMedia(
         val id: Int,
-        val title: TitleData,
-        val description: String?,
-        val coverImage: CoverData,
+        val idMal: Int? = null,
+        val title: AnilistTitle,
+        val description: String? = null,
+        val coverImage: AnilistCoverImage,
         val bannerImage: String?,
-        val episodes: Int?,
         val format: String?,
-        val genres: List<String>?,
-        val averageScore: Int?,
+        val season: String? = null,
+        val seasonYear: Int? = null,
+        val episodes: Int?,
+        val duration: Int? = null,
         val status: String?,
-        val season: String?,
-        val seasonYear: Int?,
-        val studios: StudiosData?,
-        val nextAiringEpisode: NextAiringEpisode?
+        val averageScore: Int?,
+        val meanScore: Int? = null,
+        val popularity: Int? = null,
+        val favourites: Int? = null,
+        val genres: List<String>?,
+        val tags: List<AnilistTag>? = null,
+        val source: String? = null,
+        val countryOfOrigin: String? = null,
+        val isAdult: Boolean? = null,
+        val synonyms: List<String>? = null,
+        val siteUrl: String? = null,
+        val trailer: AnilistTrailer? = null,
+        val studios: AnilistStudios?,
+        val nextAiringEpisode: AnilistNextAiring?,
+        val startDate: AnilistFuzzyDate? = null,
+        val endDate: AnilistFuzzyDate? = null,
+        val characters: AnilistCharacters? = null,
+        val relations: AnilistRelations? = null,
+        val recommendations: AnilistRecommendations? = null
     )
 
-    data class StudiosData(val nodes: List<StudioNode>?)
-    data class StudioNode(val name: String?)
-    data class NextAiringEpisode(val episode: Int?)
-    data class TitleData(val romaji: String?, val english: String?)
-    data class CoverData(val large: String?)
+    data class AnilistPage(val media: List<AnilistMedia>)
+    data class AnilistCollectionData(@JsonProperty("Page") val page: AnilistPage)
+    data class AnilistCollectionResponse(val data: AnilistCollectionData)
 
-    // ─── DATA CLASSES: Pipe Episodes API ─────────────────────────
+    data class AnilistAiringScheduleItem(
+        val episode: Int? = null,
+        val airingAt: Long? = null,
+        val timeUntilAiring: Long? = null,
+        val media: AnilistMedia
+    )
+    data class AnilistSchedulePage(val airingSchedules: List<AnilistAiringScheduleItem>)
+    data class AnilistScheduleData(@JsonProperty("Page") val page: AnilistSchedulePage)
+    data class AnilistScheduleResponse(val data: AnilistScheduleData)
+
+    data class AnilistLoadData(@JsonProperty("Media") val media: AnilistMedia)
+    data class AnilistLoadResponse(val data: AnilistLoadData)
+
+    // ─── DATA CLASSES: Pipe Episodes API (unchanged) ──────────────
     data class PipeEpisodesResponse(val providers: ProvidersData?)
     data class ProvidersData(
         val kiwi: ProviderData?,
@@ -630,7 +738,7 @@ class MiruroProvider : MainAPI() {
         val filler: Boolean?
     )
 
-    // ─── DATA CLASSES: Pipe Sources API ──────────────────────────
+    // ─── DATA CLASSES: Pipe Sources API (unchanged) ───────────────
     data class SourcesResponse(
         val streams:   List<StreamItem>?,
         val subtitles: List<SubtitleItem>?,
