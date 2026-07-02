@@ -9,6 +9,7 @@ import java.io.ByteArrayInputStream
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 
 /**
  * MiruroProvider — a from-scratch Kotlin port of `api.py`'s logic.
@@ -140,13 +141,35 @@ class MiruroProvider : MainAPI() {
         }
     """.trimIndent()
 
-    /** Mirrors api.py's `_anilist_query()` — real GraphQL variables, no string interpolation of user input. */
+    /**
+     * Mirrors api.py's `_anilist_query()` — real GraphQL variables, no string interpolation of user input.
+     *
+     * AniList responds to rate-limited requests with either HTTP 429, or (annoyingly) HTTP 200 with
+     * a GraphQL body of `{"data": null, "errors": [{"status": 429, ...}]}`. Left unhandled, that null
+     * `data` blows up Jackson deserialization downstream with a confusing stack trace instead of a
+     * clear "you're being rate-limited" message. We retry with backoff here so every caller
+     * (getMainPage, search, load, etc.) benefits automatically.
+     */
     private suspend fun anilistQuery(query: String, variables: Map<String, Any?> = emptyMap()): String {
-        return app.post(
-            anilistUrl,
-            json = mapOf("query" to query, "variables" to variables),
-            headers = mapOf("Content-Type" to "application/json")
-        ).text
+        val maxAttempts = 4
+        var attempt = 0
+        while (true) {
+            val response = app.post(
+                anilistUrl,
+                json = mapOf("query" to query, "variables" to variables),
+                headers = mapOf("Content-Type" to "application/json")
+            )
+            val text = response.text
+            val isRateLimited = response.code == 429 || text.contains("\"status\":429") || text.contains("Too Many Requests")
+
+            if (!isRateLimited) return text
+
+            attempt++
+            if (attempt >= maxAttempts) {
+                throw ErrorLoadingException("AniList is rate-limiting requests right now — please wait a bit and try again.")
+            }
+            delay(1000L * (1L shl (attempt - 1))) // 1s, 2s, 4s backoff
+        }
     }
 
     /** Mirrors api.py's `_fetch_collection()` — generic sort/status collection query. */
@@ -206,7 +229,7 @@ class MiruroProvider : MainAPI() {
                     else       -> "\"$k\":$v"
                 }
             }
-        },"body":null}"""
+        },"body":null,"version":"0.1.0"}"""
         return Base64.encodeToString(
             payload.toByteArray(),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
