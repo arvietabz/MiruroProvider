@@ -38,12 +38,12 @@ class AllmangaProvider : MainAPI() {
         ).text
 
         val json = AppUtils.parseJson<AnilistSearchResponse>(response)
-        
+
         return json.data?.Page?.media?.mapNotNull { media ->
             val titleStr = media.title?.english ?: media.title?.romaji ?: return@mapNotNull null
             val isMovie = media.format == "MOVIE"
             val tvType = if (isMovie) TvType.AnimeMovie else TvType.Anime
-            
+
             newAnimeSearchResponse(titleStr, "$anilistUrl/watch/${media.id}", tvType) {
                 posterUrl = media.coverImage?.large
             }
@@ -52,7 +52,7 @@ class AllmangaProvider : MainAPI() {
 
     // ─── 2. LOAD: Fetch Metadata & Map to Allmanga ───────────────
     override suspend fun load(url: String): LoadResponse {
-        val anilistId = url.substringAfter("/watch/").toIntOrNull() 
+        val anilistId = url.substringAfter("/watch/").toIntOrNull()
             ?: throw Exception("Invalid AniList ID parsing")
 
         // Fetch AniList metadata
@@ -67,10 +67,10 @@ class AllmangaProvider : MainAPI() {
               }
             }
         """.trimIndent()
-        
+
         val anilistRes = app.post(anilistUrl, json = mapOf("query" to metadataQuery)).text
         val anilistMeta = AppUtils.parseJson<AnilistMetaResponse>(anilistRes).data?.Media
-        
+
         val title = anilistMeta?.title?.english ?: anilistMeta?.title?.romaji ?: "Unknown Title"
         val queryTitle = anilistMeta?.title?.romaji ?: title
 
@@ -108,7 +108,7 @@ class AllmangaProvider : MainAPI() {
         ).text
 
         val showDetails = AppUtils.parseJson<AllmangaShowData>(epRes).data?.show
-        
+
         val subList = mutableListOf<Episode>()
         val dubList = mutableListOf<Episode>()
         val subEpisodes = showDetails?.availableEpisodesDetail?.sub ?: emptyList()
@@ -120,7 +120,7 @@ class AllmangaProvider : MainAPI() {
                 this.episode = epNum.toIntOrNull()
             })
         }
-        
+
         dubEpisodes.forEach { epNum ->
             dubList.add(newEpisode("$allmangaId/dub/$epNum") {
                 this.name = "Episode $epNum (Dub)"
@@ -149,7 +149,7 @@ class AllmangaProvider : MainAPI() {
         }
     }
 
-    // ─── 3. LINKS: Decrypt URLs & Delegate to Cloudstream Extractors 
+    // ─── 3. LINKS: Decrypt URLs & Delegate to Cloudstream Extractors
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -158,9 +158,9 @@ class AllmangaProvider : MainAPI() {
     ): Boolean {
         val parts = data.split("/")
         if (parts.size < 3) return false
-        
+
         val showId = parts[0]
-        val type = parts[1] 
+        val type = parts[1]
         val epNum = parts[2]
 
         val sourceQuery = """
@@ -174,7 +174,7 @@ class AllmangaProvider : MainAPI() {
         val response = app.post(
             allmangaGraphql,
             json = mapOf(
-                "query" to sourceQuery, 
+                "query" to sourceQuery,
                 "variables" to mapOf("showId" to showId, "translationType" to type, "episodeString" to epNum)
             )
         ).text
@@ -194,25 +194,31 @@ class AllmangaProvider : MainAPI() {
                 subtitleCallback = subtitleCallback,
                 callback = callback
             )
-            
+
             // Fallback for direct streams or custom servers (like Uni)
             if (finalUrl.contains(".m3u8")) {
-                M3u8Helper.generateM3u8(
-                    name = "$name - ${source.sourceName ?: "HLS"}",
-                    url = finalUrl,
-                    referer = mainUrl
-                ).forEach(callback)
-            } else {
-                // Fix: Adjusted property from 'url' to 'streamUrl' to match your explicit dependency definitions
                 callback(
-                    ExtractorLink(
+                    newExtractorLink(
+                        source = name,
+                        name = "$name - ${source.sourceName ?: "HLS"}",
+                        url = finalUrl,
+                        type = ExtractorLinkType.M3U8
+                    ) {
+                        this.referer = mainUrl
+                        this.quality = Qualities.P1080.value
+                    }
+                )
+            } else {
+                callback(
+                    newExtractorLink(
                         source = name,
                         name = "$name - ${source.sourceName ?: "Direct MP4"}",
-                        streamUrl = finalUrl,
-                        referer = requiredReferer,
-                        quality = Qualities.P1080.value,
-                        isM3u8 = false
-                    )
+                        url = finalUrl,
+                        type = ExtractorLinkType.VIDEO
+                    ) {
+                        this.referer = requiredReferer
+                        this.quality = Qualities.P1080.value
+                    }
                 )
             }
         }
@@ -225,8 +231,8 @@ class AllmangaProvider : MainAPI() {
         if (url.startsWith("--")) {
             val hexString = url.removePrefix("--")
             return try {
-                String(hexString.chunked(2).map { 
-                    it.toInt(16).toByte() 
+                String(hexString.chunked(2).map {
+                    it.toInt(16).toByte()
                 }.toByteArray())
             } catch (e: Exception) {
                 url
@@ -236,13 +242,13 @@ class AllmangaProvider : MainAPI() {
     }
 
     // ─── DATA CLASSES FOR JSON PARSING ───────────────────────────
-    
+
     // AniList Core Models
     data class AnilistSearchResponse(val data: PageData?)
     data class PageData(@JsonProperty("Page") val Page: MediaPage?)
     data class MediaPage(val media: List<MediaItem>?)
     data class MediaItem(val id: Int, val title: TitleBlock?, val coverImage: ImageBlock?, val format: String?)
-    
+
     data class AnilistMetaResponse(val data: MetaData?)
     data class MetaData(@JsonProperty("Media") val Media: FullMediaItem?)
     data class FullMediaItem(val title: TitleBlock?, val description: String?, val coverImage: ImageBlock?, val bannerImage: String?, val format: String?)
