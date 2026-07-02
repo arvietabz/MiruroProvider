@@ -464,7 +464,10 @@ class MiruroProvider : MainAPI() {
                 this.duration       = media.duration
                 this.actors         = actorList
                 this.recommendations = recommendationList
-                trailer?.let { addTrailer(it) }
+                // TODO: addTrailer() isn't resolving against the current CloudStream API jar.
+                // Re-enable once you confirm the correct call for your pinned API version
+                // (it may now be `this.trailers = mutableListOf(TrailerData(it))` instead).
+                // trailer?.let { addTrailer(it) }
             }
         } else {
             newAnimeLoadResponse(name = title, url = url, type = TvType.Anime) {
@@ -478,7 +481,8 @@ class MiruroProvider : MainAPI() {
                 this.actors         = actorList
                 this.recommendations = recommendationList
                 this.showStatus     = if (media.status == "RELEASING") ShowStatus.Ongoing else ShowStatus.Completed
-                trailer?.let { addTrailer(it) }
+                // TODO: addTrailer() isn't resolving against the current CloudStream API jar — see note above.
+                // trailer?.let { addTrailer(it) }
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
