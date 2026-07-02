@@ -109,23 +109,29 @@ class AllmangaProvider : MainAPI() {
 
         val showDetails = AppUtils.parseJson<AllmangaShowData>(epRes).data?.show
         
-        val episodes = mutableListOf<Episode>()
+        val subList = mutableListOf<Episode>()
+        val dubList = mutableListOf<Episode>()
         val subEpisodes = showDetails?.availableEpisodesDetail?.sub ?: emptyList()
         val dubEpisodes = showDetails?.availableEpisodesDetail?.dub ?: emptyList()
 
         subEpisodes.forEach { epNum ->
-            episodes.add(newEpisode("$allmangaId/sub/$epNum") {
+            subList.add(newEpisode("$allmangaId/sub/$epNum") {
                 this.name = "Episode $epNum"
                 this.episode = epNum.toIntOrNull()
             })
         }
         
         dubEpisodes.forEach { epNum ->
-            episodes.add(newEpisode("$allmangaId/dub/$epNum") {
+            dubList.add(newEpisode("$allmangaId/dub/$epNum") {
                 this.name = "Episode $epNum (Dub)"
                 this.episode = epNum.toIntOrNull()
             })
         }
+
+        // Fix: Explicitly map lists into a DubStatus Map structure matching Cloudstream expectations
+        val episodeMap = mutableMapOf<DubStatus, List<Episode>>()
+        if (subList.isNotEmpty()) episodeMap[DubStatus.Subbed] = subList
+        if (dubList.isNotEmpty()) episodeMap[DubStatus.Dubbed] = dubList
 
         return if (anilistMeta?.format == "MOVIE") {
             newMovieLoadResponse(title, url, TvType.AnimeMovie, "$allmangaId/sub/1") {
@@ -138,7 +144,7 @@ class AllmangaProvider : MainAPI() {
                 posterUrl = anilistMeta?.coverImage?.extraLarge
                 backgroundPosterUrl = anilistMeta?.bannerImage
                 plot = anilistMeta?.description?.replace(Regex("<.*?>"), "")
-                this.episodes = episodes
+                this.episodes = episodeMap
             }
         }
     }
@@ -174,17 +180,14 @@ class AllmangaProvider : MainAPI() {
         ).text
 
         val sourceUrls = AppUtils.parseJson<AllmangaEpisodeData>(response).data?.episode?.sourceUrls ?: return false
+        val requiredReferer = "https://allanimenews.com/"
 
-        // Iterate through the embed links provided by Allmanga
         sourceUrls.forEach { source ->
             val rawUrl = source.sourceUrl
             val decodedUrl = decodeAllmangaUrl(rawUrl)
-            
-            // Format URL properly if it lacks a protocol
             val finalUrl = if (decodedUrl.startsWith("//")) "https:$decodedUrl" else decodedUrl
 
-            // 1. Delegate known iframe hosts to Cloudstream's native extractors
-            // (Cloudstream natively handles Filemoon, Mp4Upload, Okru, Vidstreaming, etc.)
+            // Delegate known hosts to Cloudstream's native internal extractors
             loadExtractor(
                 url = finalUrl,
                 referer = mainUrl,
@@ -192,14 +195,25 @@ class AllmangaProvider : MainAPI() {
                 callback = callback
             )
             
-            // 2. Fallback for custom servers (like "Uni" or direct raw links)
-            // If the decoded URL is already an m3u8 or mp4, we add it directly
+            // Fallback for direct streams or custom servers (like Uni)
             if (finalUrl.contains(".m3u8")) {
                 M3u8Helper.generateM3u8(
                     name = "$name - ${source.sourceName ?: "HLS"}",
                     url = finalUrl,
                     referer = mainUrl
                 ).forEach(callback)
+            } else {
+                // Fix: Adjusted property from 'url' to 'streamUrl' to match your explicit dependency definitions
+                callback(
+                    ExtractorLink(
+                        source = name,
+                        name = "$name - ${source.sourceName ?: "Direct MP4"}",
+                        streamUrl = finalUrl,
+                        referer = requiredReferer,
+                        quality = Qualities.P1080.value,
+                        isM3u8 = false
+                    )
+                )
             }
         }
 
@@ -208,19 +222,14 @@ class AllmangaProvider : MainAPI() {
 
     // ─── HELPER: Decode Allmanga Embed Links ──────────────────────
     private fun decodeAllmangaUrl(url: String): String {
-        // Allmanga encrypts their iframe URLs. A common pattern is prepending 
-        // with "--" and encoding the string as a hex map.
         if (url.startsWith("--")) {
             val hexString = url.removePrefix("--")
             return try {
-                // Typical hex to ascii decryption for Allmanga/AllAnime
                 String(hexString.chunked(2).map { 
-                    // Depending on their current cipher, it might be a raw parse 
-                    // or require a basic XOR. Standard parse is most common:
                     it.toInt(16).toByte() 
                 }.toByteArray())
             } catch (e: Exception) {
-                url // Fallback if decryption fails
+                url
             }
         }
         return url
