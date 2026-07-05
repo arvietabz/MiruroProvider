@@ -3,8 +3,11 @@ package com.miruro
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import android.util.Base64
+import android.util.Log
+import android.widget.Toast
 import java.util.zip.GZIPInputStream
 import java.io.ByteArrayInputStream
 import kotlinx.coroutines.async
@@ -12,39 +15,32 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 
-/**
- * MiruroProvider — standalone Kotlin port of api.py.
- *
- * KEY FIX vs previous version:
- *   api.py's _inject_source_slugs() rewrites each episode's "id" field to the
- *   full watch-path string:
- *       watch/{provider}/{anilistId}/{category}/{prefix}-{number}
- *   The /watch route then passes that full string as the episodeId to
- *   get_sources(), which base64-encodes it before putting it in the pipe query.
- *
- *   The previous Kotlin port passed only the raw translated ID (e.g.
- *   "animepahe:abc123") to fetchSources(), which caused the pipe to return no
- *   streams → "No links found".
- *
- *   The fix: after _deep_translate (translateId), also run _inject_source_slugs
- *   logic so every EpisodeItem.id becomes the full watch-path.  fetchSources()
- *   then base64-encodes that full path, exactly as api.py does.
- */
 class MiruroProvider : MainAPI() {
 
     override var mainUrl = "https://www.miruro.tv"
-    override var name = "Miruro"
-    override val hasMainPage = true
-    override var lang = "en"
+    override var name    = "Miruro"
+    override val hasMainPage        = true
+    override var lang               = "en"
     override val hasDownloadSupport = true
-    override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie)
+    override val supportedTypes     = setOf(TvType.Anime, TvType.AnimeMovie)
 
+    private val TAG        = "MiruroProvider"
     private val anilistUrl = "https://graphql.anilist.co"
     private val pipeUrl    = "$mainUrl/api/secure/pipe"
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Cloudflare bypass headers — mirrors api.py HEADERS exactly.
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── Toast helper ─────────────────────────────────────────────────────────
+    // Shows a short on-screen message so you can debug without logcat.
+    // CloudStream runs on the main thread for UI; we use the app context.
+    private fun toast(msg: String) {
+        try {
+            val ctx = AcraApplication.context ?: return
+            android.os.Handler(android.os.Looper.getMainLooper()).post {
+                Toast.makeText(ctx, msg, Toast.LENGTH_LONG).show()
+            }
+        } catch (_: Exception) {}
+    }
+
+    // ── CF bypass headers ─────────────────────────────────────────────────────
     private val cfBypassHeaders = mapOf(
         "User-Agent"         to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
         "Referer"            to "$mainUrl/",
@@ -60,11 +56,10 @@ class MiruroProvider : MainAPI() {
         "sec-ch-ua-platform" to "\"Windows\""
     )
 
-    private val jsonMapper = jacksonObjectMapper()
+    private val jsonMapper = jacksonObjectMapper().apply {
+        configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+    }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  Provider list
-    // ─────────────────────────────────────────────────────────────────────────
     private val streamProviders = listOf(
         StreamProviderConfig("kiwi", "sub", "Kiwi"),
         StreamProviderConfig("bee",  "sub", "Bee"),
@@ -72,68 +67,29 @@ class MiruroProvider : MainAPI() {
         StreamProviderConfig("dune", "sub", "Dune"),
         StreamProviderConfig("ally", "sub", "Ally")
     )
-
     data class StreamProviderConfig(val id: String, val category: String, val label: String)
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  AniList GraphQL field fragments
-    // ══════════════════════════════════════════════════════════════════════════
-
+    // ── AniList field fragments ───────────────────────────────────────────────
     private val mediaListFields = """
-        id
-        title { romaji english native }
-        coverImage { large extraLarge }
-        bannerImage
-        format
-        season
-        seasonYear
-        episodes
-        duration
-        status
-        averageScore
-        meanScore
-        popularity
-        favourites
-        genres
-        source
-        countryOfOrigin
-        isAdult
+        id title { romaji english native }
+        coverImage { large extraLarge } bannerImage format season seasonYear
+        episodes duration status averageScore meanScore popularity favourites
+        genres source countryOfOrigin isAdult
         studios(isMain: true) { nodes { name isAnimationStudio } }
         nextAiringEpisode { episode airingAt timeUntilAiring }
-        startDate { year month day }
-        endDate { year month day }
+        startDate { year month day } endDate { year month day }
     """.trimIndent()
 
     private val mediaFullFields = """
-        id
-        idMal
-        title { romaji english native }
-        description(asHtml: false)
-        coverImage { large extraLarge color }
-        bannerImage
-        format
-        season
-        seasonYear
-        episodes
-        duration
-        status
-        averageScore
-        meanScore
-        popularity
-        favourites
-        trending
-        genres
-        tags { name rank isMediaSpoiler }
-        source
-        countryOfOrigin
-        isAdult
-        synonyms
-        siteUrl
-        trailer { id site thumbnail }
+        id idMal title { romaji english native }
+        description(asHtml: false) coverImage { large extraLarge color }
+        bannerImage format season seasonYear episodes duration status
+        averageScore meanScore popularity favourites trending genres
+        tags { name rank isMediaSpoiler } source countryOfOrigin isAdult
+        synonyms siteUrl trailer { id site thumbnail }
         studios { nodes { name isAnimationStudio } }
         nextAiringEpisode { episode airingAt timeUntilAiring }
-        startDate { year month day }
-        endDate { year month day }
+        startDate { year month day } endDate { year month day }
         characters(sort: [ROLE, RELEVANCE], perPage: 25) {
             edges {
                 role
@@ -144,32 +100,15 @@ class MiruroProvider : MainAPI() {
         relations {
             edges {
                 relationType(version: 2)
-                node {
-                    id
-                    title { romaji english }
-                    coverImage { large }
-                    format
-                    type
-                    status
-                }
+                node { id title { romaji english } coverImage { large } format type status }
             }
         }
         recommendations(sort: RATING_DESC, perPage: 10) {
-            nodes {
-                mediaRecommendation {
-                    id
-                    title { romaji english }
-                    coverImage { large }
-                    format
-                }
-            }
+            nodes { mediaRecommendation { id title { romaji english } coverImage { large } format } }
         }
     """.trimIndent()
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  AniList helper — with rate-limit retry
-    // ══════════════════════════════════════════════════════════════════════════
-
+    // ── AniList query ─────────────────────────────────────────────────────────
     private suspend fun anilistQuery(query: String, variables: Map<String, Any?> = emptyMap()): String {
         val maxAttempts = 4
         var attempt = 0
@@ -186,16 +125,13 @@ class MiruroProvider : MainAPI() {
             if (!rateLimited) return text
             attempt++
             if (attempt >= maxAttempts)
-                throw ErrorLoadingException("AniList is rate-limiting — please wait a moment and retry.")
+                throw ErrorLoadingException("AniList rate-limited — retry in a moment.")
             delay(1000L * (1L shl (attempt - 1)))
         }
     }
 
     private suspend fun fetchCollection(
-        sortType: String,
-        status: String? = null,
-        page: Int,
-        perPage: Int = 20
+        sortType: String, status: String? = null, page: Int, perPage: Int = 20
     ): List<AnilistMedia> {
         val statusArg = if (status != null) ", status: $status" else ""
         val gql = """
@@ -205,219 +141,205 @@ class MiruroProvider : MainAPI() {
                 }
             }
         """.trimIndent()
-        val text = anilistQuery(gql, mapOf("page" to page, "perPage" to perPage))
-        return AppUtils.parseJson<AnilistCollectionResponse>(text).data.page.media
+        return AppUtils.parseJson<AnilistCollectionResponse>(
+            anilistQuery(gql, mapOf("page" to page, "perPage" to perPage))
+        ).data.page.media
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Miruro Pipe helpers
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Mirrors api.py _encode_pipe_request().
-     * JSON-serialises the payload then base64url-encodes without padding.
-     */
+    // ── Pipe helpers ──────────────────────────────────────────────────────────
     private fun encodePipeRequest(path: String, query: Map<String, Any>): String {
         val payload = mapOf(
-            "path"    to path,
-            "method"  to "GET",
-            "query"   to query,
-            "body"    to null,
-            "version" to "0.1.0"
+            "path" to path, "method" to "GET",
+            "query" to query, "body" to null, "version" to "0.1.0"
         )
-        val json = jsonMapper.writeValueAsString(payload)
         return Base64.encodeToString(
-            json.toByteArray(Charsets.UTF_8),
+            jsonMapper.writeValueAsString(payload).toByteArray(Charsets.UTF_8),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
     }
 
-    /**
-     * Mirrors api.py _decode_pipe_response().
-     * Re-pads the base64url string, decodes, then gunzips.
-     */
     private fun decodePipeResponse(text: String): String {
         val trimmed = text.trimEnd()
         val padded  = trimmed + "=".repeat((4 - trimmed.length % 4) % 4)
         val compressed = Base64.decode(padded, Base64.URL_SAFE)
         return GZIPInputStream(ByteArrayInputStream(compressed))
-            .bufferedReader(Charsets.UTF_8)
-            .readText()
+            .bufferedReader(Charsets.UTF_8).readText()
     }
 
     /**
-     * Mirrors api.py _translate_id().
-     * Episode IDs from the pipe are base64url-encoded "originalId:suffix" strings.
-     * Decodes them to get the raw provider ID like "animepahe:abc123".
+     * Core pipe call. Toasts the HTTP status so you can see CF blocks on device.
+     * On non-200 it toasts the first 120 chars of the response body.
      */
+    private suspend fun pipeGet(path: String, query: Map<String, Any>): String {
+        val e        = encodePipeRequest(path, query)
+        val response = app.get("$pipeUrl?e=$e", headers = cfBypassHeaders)
+        val code     = response.code
+        Log.d(TAG, "pipeGet[$path] HTTP $code")
+
+        if (code != 200) {
+            val body    = response.text.take(120)
+            val msg     = "[$path] HTTP $code: $body"
+            Log.e(TAG, "pipeGet FAIL: $msg")
+            toast("⛔ Pipe $path → HTTP $code\n$body")
+            throw ErrorLoadingException(msg)
+        }
+
+        return try {
+            decodePipeResponse(response.text.trim())
+        } catch (ex: Exception) {
+            val raw = response.text.take(120)
+            val msg = "[$path] decode failed: ${ex.message} | raw: $raw"
+            Log.e(TAG, msg, ex)
+            toast("⛔ Pipe $path decode fail\n${ex.message}")
+            throw ErrorLoadingException(msg)
+        }
+    }
+
+    // ── ID translation ────────────────────────────────────────────────────────
     private fun translateId(encodedId: String): String {
         return try {
             val padded  = encodedId + "=".repeat((4 - encodedId.length % 4) % 4)
             val decoded = Base64.decode(padded, Base64.URL_SAFE).toString(Charsets.UTF_8)
             if (':' in decoded) decoded else encodedId
-        } catch (e: Exception) {
-            encodedId
-        }
+        } catch (_: Exception) { encodedId }
     }
 
     /**
-     * Mirrors api.py _inject_source_slugs() for a single episode.
-     *
-     * api.py rewrites ep["id"] to:
-     *     "watch/{provider}/{anilistId}/{category}/{prefix}-{number}"
-     *
-     * This is the episodeId that gets base64-encoded and sent to the sources
-     * pipe.  Without this rewrite the pipe returns no streams.
-     *
-     * Example:
-     *   rawTranslatedId = "animepahe:abc123"
-     *   provider        = "kiwi"
-     *   anilistId       = 178005
-     *   category        = "sub"
-     *   epNumber        = 1
+     * Mirrors api.py _inject_source_slugs() for one episode.
+     * "animepahe:xyz", provider=kiwi, id=178005, cat=sub, ep=1
      *   → "watch/kiwi/178005/sub/animepahe-1"
+     * This full string is then base64-encoded as episodeId in the sources query.
      */
     private fun injectSourceSlug(
-        rawTranslatedId: String,
-        provider: String,
-        anilistId: Int,
-        category: String,
-        epNumber: Int
+        translatedId: String, provider: String,
+        anilistId: Int, category: String, epNumber: Int
     ): String {
-        val prefix = if (':' in rawTranslatedId) rawTranslatedId.split(":")[0] else rawTranslatedId
+        val prefix = if (':' in translatedId) translatedId.split(":")[0] else translatedId
         return "watch/$provider/$anilistId/$category/$prefix-$epNumber"
     }
 
+    // ── Episodes ──────────────────────────────────────────────────────────────
     /**
-     * Mirrors api.py pipeGet helper.
-     * Sends GET to /api/secure/pipe with CF-bypass headers, returns decoded JSON.
-     */
-    private suspend fun pipeGet(path: String, query: Map<String, Any>): String {
-        val e        = encodePipeRequest(path, query)
-        val response = app.get("$pipeUrl?e=$e", headers = cfBypassHeaders)
-        if (response.code != 200) {
-            throw ErrorLoadingException(
-                "Pipe request failed (HTTP ${response.code}). " +
-                "If 403, Cloudflare is blocking this IP. " +
-                "Residential / non-datacenter IPs are required."
-            )
-        }
-        return decodePipeResponse(response.text.trim())
-    }
-
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Episodes
-    //
-    //  Fetches all providers in one pipe call, then:
-    //    1. _deep_translate each episode id  (translateId)
-    //    2. _inject_source_slugs             (injectSourceSlug)
-    //
-    //  After step 2, EpisodeItem.id == "watch/{provider}/{anilistId}/{cat}/{slug}"
-    //  which is exactly what fetchSources() must base64-encode and send.
-    // ══════════════════════════════════════════════════════════════════════════
-
-    /**
-     * Returns a map of providerName → list of EpisodeItems whose .id fields
-     * have already been through both _deep_translate AND _inject_source_slugs,
-     * matching api.py's /episodes response exactly.
+     * One pipe call → translate IDs → inject slugs.
+     * Toasts a summary of what was found so you can see it on device.
      */
     private suspend fun fetchAllProviderEpisodes(anilistId: Int): Map<String, List<EpisodeItem>> {
         return try {
             val decoded = pipeGet("episodes", mapOf("anilistId" to anilistId))
-            val resp    = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
-            val provs   = resp.providers ?: return emptyMap()
+            Log.d(TAG, "episodes JSON (first 400): ${decoded.take(400)}")
 
-            buildMap {
-                fun processProvider(providerName: String, data: ProviderData?) {
-                    val category = "sub"
-                    val rawList  = data?.episodes?.sub ?: return
-                    val injected = rawList.map { ep ->
-                        // Step 1: _deep_translate
-                        val translatedId = translateId(ep.id)
-                        // Step 2: _inject_source_slugs
-                        val slugId = injectSourceSlug(translatedId, providerName, anilistId, category, ep.number)
-                        ep.copy(id = slugId)
-                    }
-                    if (injected.isNotEmpty()) put(providerName, injected)
-                }
+            val resp  = AppUtils.parseJson<PipeEpisodesResponse>(decoded)
+            val provs = resp.providers
 
-                processProvider("kiwi", provs.kiwi)
-                processProvider("bee",  provs.bee)
-                processProvider("hop",  provs.hop)
-                processProvider("dune", provs.dune)
-                processProvider("ally", provs.ally)
+            if (provs == null) {
+                toast("⚠️ Episodes: providers field is null\n${decoded.take(100)}")
+                return emptyMap()
             }
+
+            val result = buildMap<String, List<EpisodeItem>> {
+                fun process(name: String, data: ProviderData?) {
+                    val rawList = data?.episodes?.sub
+                    if (rawList.isNullOrEmpty()) return
+                    put(name, rawList.map { ep ->
+                        val translated = translateId(ep.id)
+                        val slug       = injectSourceSlug(translated, name, anilistId, "sub", ep.number)
+                        Log.d(TAG, "  $name ep#${ep.number}: ${ep.id} → $slug")
+                        ep.copy(id = slug)
+                    })
+                }
+                process("kiwi", provs.kiwi)
+                process("bee",  provs.bee)
+                process("hop",  provs.hop)
+                process("dune", provs.dune)
+                process("ally", provs.ally)
+            }
+
+            // ── Toast: tell user what providers/episode counts we got ──────────
+            if (result.isEmpty()) {
+                toast("⚠️ Episodes: pipe OK but 0 providers parsed\nJSON: ${decoded.take(100)}")
+            } else {
+                val summary = result.entries.joinToString(" | ") { "${it.key}:${it.value.size}ep" }
+                toast("✅ Episodes loaded\n$summary")
+            }
+
+            result
         } catch (ex: Exception) {
+            Log.e(TAG, "fetchAllProviderEpisodes failed: ${ex.message}", ex)
+            // Only toast if it wasn't already toasted inside pipeGet
+            if (ex !is ErrorLoadingException) {
+                toast("⛔ Episodes parse error\n${ex.message?.take(100)}")
+            }
             emptyMap()
         }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  Sources
-    //
-    //  api.py get_sources():
-    //    enc_id = base64.urlsafe_b64encode(episodeId.encode()).decode().rstrip('=')
-    //    pipe query = { episodeId: enc_id, provider, category, anilistId }
-    //
-    //  episodeId here is the FULL slug path produced by _inject_source_slugs,
-    //  e.g. "watch/kiwi/178005/sub/animepahe-1".
-    // ══════════════════════════════════════════════════════════════════════════
-
+    // ── Sources ───────────────────────────────────────────────────────────────
+    /**
+     * base64-encodes the full slug path as episodeId — mirrors api.py enc_id.
+     * Toasts the slug being requested and the stream count returned.
+     */
     private suspend fun fetchSources(
-        episodeSlugId: String,   // already the full "watch/…" path from injectSourceSlug
-        provider: String,
-        category: String,
-        anilistId: Int
+        episodeSlugId: String, provider: String, category: String, anilistId: Int
     ): SourcesResponse {
-        // base64url-encode the full slug path, no padding — mirrors api.py enc_id
         val encodedEpisodeId = Base64.encodeToString(
             episodeSlugId.toByteArray(Charsets.UTF_8),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING
         )
-        val query = mapOf(
+        Log.d(TAG, "fetchSources: slug=$episodeSlugId enc=$encodedEpisodeId")
+        toast("🔍 [$provider] fetching\n$episodeSlugId")
+
+        val decoded = pipeGet("sources", mapOf(
             "episodeId" to encodedEpisodeId,
             "provider"  to provider,
             "category"  to category,
             "anilistId" to anilistId
-        )
-        val decoded = pipeGet("sources", query)
-        return AppUtils.parseJson<SourcesResponse>(decoded)
+        ))
+
+        Log.d(TAG, "sources JSON (first 400): ${decoded.take(400)}")
+
+        return try {
+            val resp = AppUtils.parseJson<SourcesResponse>(decoded)
+
+            // ── Toast: raw stream counts from every block ─────────────────────
+            val topCount  = resp.streams?.size ?: 0
+            val ssubCount = resp.ssub?.streams?.size ?: 0
+            val hsubCount = resp.hsub?.streams?.size ?: 0
+            val subCount  = resp.subtitles?.size ?: 0
+            toast("[$provider] streams: top=$topCount ssub=$ssubCount hsub=$hsubCount subs=$subCount\n${decoded.take(80)}")
+
+            resp
+        } catch (ex: Exception) {
+            Log.e(TAG, "sources parse failed: ${ex.message}", ex)
+            toast("⛔ [$provider] parse fail\n${ex.message?.take(80)}\nraw: ${decoded.take(80)}")
+            throw ex
+        }
     }
 
-    // ══════════════════════════════════════════════════════════════════════════
-    //  URL helpers
-    // ══════════════════════════════════════════════════════════════════════════
-
+    // ── URL helpers ───────────────────────────────────────────────────────────
     private fun slugify(text: String): String =
-        text.lowercase()
-            .replace(Regex("[^a-z0-9\\s]"), "")
-            .trim()
-            .replace(Regex("\\s+"), "-")
+        text.lowercase().replace(Regex("[^a-z0-9\\s]"), "").trim().replace(Regex("\\s+"), "-")
+
+    // Robust: regex instead of blind split()[4] — handles slugs with numbers
+    private fun extractAnilistId(url: String): Int? =
+        Regex("/watch/(\\d+)").find(url)?.groupValues?.get(1)?.toIntOrNull()
 
     private fun AnilistMedia.toSearchResult(): SearchResponse? {
         val titleStr = title.english ?: title.romaji ?: return null
-        val slug     = slugify(titleStr)
-        val watchUrl = "$mainUrl/watch/$id/$slug"
-        val tvType   = if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
-        return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
-            posterUrl = coverImage.large
-        }
+        return newAnimeSearchResponse(titleStr, "$mainUrl/watch/$id/${slugify(titleStr)}",
+            if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
+        ) { posterUrl = coverImage.large }
     }
 
     private fun AnilistRelatedMedia.toSearchResult(): SearchResponse? {
         val titleStr = title.english ?: title.romaji ?: return null
-        val slug     = slugify(titleStr)
-        val watchUrl = "$mainUrl/watch/$id/$slug"
-        val tvType   = if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
-        return newAnimeSearchResponse(titleStr, watchUrl, tvType) {
-            posterUrl = coverImage?.large
-        }
+        return newAnimeSearchResponse(titleStr, "$mainUrl/watch/$id/${slugify(titleStr)}",
+            if (format == "MOVIE") TvType.AnimeMovie else TvType.Anime
+        ) { posterUrl = coverImage?.large }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     //  MAIN PAGE
     // ══════════════════════════════════════════════════════════════════════════
-
     override val mainPage = mainPageOf(
         "recent"    to "Recently Aired",
         "trending"  to "Trending Now",
@@ -431,7 +353,6 @@ class MiruroProvider : MainAPI() {
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val home: List<SearchResponse> = when (request.data) {
-
             "spotlight" -> {
                 if (page > 1) emptyList() else {
                     val gql = """
@@ -441,36 +362,28 @@ class MiruroProvider : MainAPI() {
                             }
                         }
                     """.trimIndent()
-                    val text = anilistQuery(gql)
-                    AppUtils.parseJson<AnilistCollectionResponse>(text)
+                    AppUtils.parseJson<AnilistCollectionResponse>(anilistQuery(gql))
                         .data.page.media.mapNotNull { it.toSearchResult() }
                 }
             }
-
             "trending"  -> fetchCollection("TRENDING_DESC", page = page).mapNotNull { it.toSearchResult() }
             "popular"   -> fetchCollection("POPULARITY_DESC", page = page).mapNotNull { it.toSearchResult() }
             "upcoming"  -> fetchCollection("POPULARITY_DESC", "NOT_YET_RELEASED", page).mapNotNull { it.toSearchResult() }
             "recent"    -> fetchCollection("START_DATE_DESC", "RELEASING", page).mapNotNull { it.toSearchResult() }
             "finished"  -> fetchCollection("TRENDING_DESC", "FINISHED", page).mapNotNull { it.toSearchResult() }
-
-            "schedule" -> {
+            "schedule"  -> {
                 val gql = """
                     query (${'$'}page: Int, ${'$'}perPage: Int) {
                         Page(page: ${'$'}page, perPage: ${'$'}perPage) {
-                            airingSchedules(notYetAired: true, sort: TIME) {
-                                media { $mediaListFields }
-                            }
+                            airingSchedules(notYetAired: true, sort: TIME) { media { $mediaListFields } }
                         }
                     }
                 """.trimIndent()
-                val text = anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
-                AppUtils.parseJson<AnilistScheduleResponse>(text)
-                    .data.page.airingSchedules
-                    .map { it.media }
-                    .distinctBy { it.id }
+                AppUtils.parseJson<AnilistScheduleResponse>(
+                    anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
+                ).data.page.airingSchedules.map { it.media }.distinctBy { it.id }
                     .mapNotNull { it.toSearchResult() }
             }
-
             "movies" -> {
                 val gql = """
                     query (${'$'}page: Int, ${'$'}perPage: Int) {
@@ -479,16 +392,14 @@ class MiruroProvider : MainAPI() {
                         }
                     }
                 """.trimIndent()
-                val text = anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
-                AppUtils.parseJson<AnilistCollectionResponse>(text)
-                    .data.page.media.mapNotNull { it.toSearchResult() }
+                AppUtils.parseJson<AnilistCollectionResponse>(
+                    anilistQuery(gql, mapOf("page" to page, "perPage" to 20))
+                ).data.page.media.mapNotNull { it.toSearchResult() }
             }
-
             else -> emptyList()
         }
-
         return newHomePageResponse(
-            list    = HomePageList(name = request.name, list = home, isHorizontalImages = false),
+            HomePageList(request.name, home, isHorizontalImages = false),
             hasNext = request.data != "spotlight"
         )
     }
@@ -496,7 +407,6 @@ class MiruroProvider : MainAPI() {
     // ══════════════════════════════════════════════════════════════════════════
     //  SEARCH
     // ══════════════════════════════════════════════════════════════════════════
-
     override suspend fun search(query: String): List<SearchResponse> {
         val gql = """
             query (${'$'}search: String, ${'$'}page: Int, ${'$'}perPage: Int) {
@@ -507,27 +417,26 @@ class MiruroProvider : MainAPI() {
                 }
             }
         """.trimIndent()
-        val text = anilistQuery(gql, mapOf("search" to query, "page" to 1, "perPage" to 20))
-        return AppUtils.parseJson<AnilistCollectionResponse>(text)
-            .data.page.media.mapNotNull { it.toSearchResult() }
+        return AppUtils.parseJson<AnilistCollectionResponse>(
+            anilistQuery(gql, mapOf("search" to query, "page" to 1, "perPage" to 20))
+        ).data.page.media.mapNotNull { it.toSearchResult() }
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     //  LOAD
     // ══════════════════════════════════════════════════════════════════════════
-
     override suspend fun load(url: String): LoadResponse {
-        val anilistId = url.split("/")[4].toInt()
+        val anilistId = extractAnilistId(url)
+            ?: throw ErrorLoadingException("Cannot extract anilistId from: $url")
 
         val gql = """
             query (${'$'}id: Int) {
-                Media(id: ${'$'}id, type: ANIME) {
-                    $mediaFullFields
-                }
+                Media(id: ${'$'}id, type: ANIME) { $mediaFullFields }
             }
         """.trimIndent()
-        val text  = anilistQuery(gql, mapOf("id" to anilistId))
-        val media = AppUtils.parseJson<AnilistLoadResponse>(text).data.media
+        val media = AppUtils.parseJson<AnilistLoadResponse>(
+            anilistQuery(gql, mapOf("id" to anilistId))
+        ).data.media
 
         val title   = media.title.english ?: media.title.romaji ?: "Unknown"
         val isMovie = media.format == "MOVIE"
@@ -536,21 +445,14 @@ class MiruroProvider : MainAPI() {
 
         val tagList = (media.genres.orEmpty() + (media.tags.orEmpty()
             .filter { it.isMediaSpoiler != true && (it.rank ?: 0) >= 60 }
-            .mapNotNull { it.name }))
-            .distinct()
+            .mapNotNull { it.name })).distinct()
 
-        // One pipe call — episodes already have fully-injected slug IDs
         val allProviderEpisodes = fetchAllProviderEpisodes(anilistId)
-        val bestProviderEpisodes = streamProviders.firstNotNullOfOrNull { cfg ->
-            allProviderEpisodes[cfg.id]?.takeIf { it.isNotEmpty() }
-        }
+        val bestEpisodes = streamProviders
+            .firstNotNullOfOrNull { cfg -> allProviderEpisodes[cfg.id]?.takeIf { it.isNotEmpty() } }
 
-        val episodes = if (!bestProviderEpisodes.isNullOrEmpty()) {
-            bestProviderEpisodes.map { ep ->
-                // Store the injected slug ID in the episode data URL so
-                // loadLinks() can retrieve it without a second pipe call.
-                // Format: {mainUrl}/watch/{anilistId}/{slug}?ep={number}
-                // The actual ep.id (the slug path) is embedded as epid param.
+        val episodes = if (!bestEpisodes.isNullOrEmpty()) {
+            bestEpisodes.map { ep ->
                 newEpisode("$mainUrl/watch/$anilistId/$slug?ep=${ep.number}") {
                     this.episode     = ep.number
                     this.name        = ep.title
@@ -559,15 +461,15 @@ class MiruroProvider : MainAPI() {
                 }
             }
         } else {
-            val episodeCount = when {
+            val count = when {
                 media.status == "RELEASING" && media.nextAiringEpisode?.episode != null ->
                     (media.nextAiringEpisode.episode ?: 1) - 1
                 media.episodes != null -> media.episodes
                 else -> 1
             }
-            (1..episodeCount).map { epNum ->
-                newEpisode("$mainUrl/watch/$anilistId/$slug?ep=$epNum") {
-                    this.episode   = epNum
+            (1..count).map { n ->
+                newEpisode("$mainUrl/watch/$anilistId/$slug?ep=$n") {
+                    this.episode   = n
                     this.posterUrl = media.coverImage.large
                 }
             }
@@ -575,45 +477,30 @@ class MiruroProvider : MainAPI() {
 
         val actorList = media.characters?.edges?.mapNotNull { edge ->
             val charName = edge.node?.name?.full ?: return@mapNotNull null
-            ActorData(
-                actor      = Actor(charName, edge.node.image?.large),
-                roleString = edge.voiceActors?.firstOrNull()?.name?.full
-            )
+            ActorData(Actor(charName, edge.node.image?.large),
+                edge.voiceActors?.firstOrNull()?.name?.full)
         }
 
-        val recFromRecs = media.recommendations?.nodes
-            ?.mapNotNull { it.mediaRecommendation?.toSearchResult() }.orEmpty()
-        val recFromRelations = media.relations?.edges
-            ?.mapNotNull { it.node }
-            ?.mapNotNull { it.toSearchResult() }.orEmpty()
-        val recommendationList = (recFromRelations + recFromRecs).distinctBy { it.url }.ifEmpty { null }
+        val recList = ((media.relations?.edges?.mapNotNull { it.node?.toSearchResult() }.orEmpty())
+            + (media.recommendations?.nodes?.mapNotNull { it.mediaRecommendation?.toSearchResult() }.orEmpty()))
+            .distinctBy { it.url }.ifEmpty { null }
 
         val yearVal = media.startDate?.year ?: media.seasonYear
 
         return if (isMovie) {
-            newMovieLoadResponse(name = title, url = url, type = TvType.AnimeMovie, dataUrl = url) {
-                posterUrl            = media.coverImage.large
-                backgroundPosterUrl  = media.bannerImage
-                this.plot            = plot
-                tags                 = tagList
-                score                = Score.from100(media.averageScore)
-                this.year            = yearVal
-                this.duration        = media.duration
-                this.actors          = actorList
-                this.recommendations = recommendationList
+            newMovieLoadResponse(title, url, TvType.AnimeMovie, url) {
+                posterUrl = media.coverImage.large; backgroundPosterUrl = media.bannerImage
+                this.plot = plot; tags = tagList; score = Score.from100(media.averageScore)
+                this.year = yearVal; this.duration = media.duration
+                this.actors = actorList; recommendations = recList
             }
         } else {
-            newAnimeLoadResponse(name = title, url = url, type = TvType.Anime) {
-                posterUrl            = media.coverImage.large
-                backgroundPosterUrl  = media.bannerImage
-                this.plot            = plot
-                tags                 = tagList
-                score                = Score.from100(media.averageScore)
-                this.year            = yearVal
-                this.duration        = media.duration
-                this.actors          = actorList
-                this.recommendations = recommendationList
-                this.showStatus      = if (media.status == "RELEASING") ShowStatus.Ongoing else ShowStatus.Completed
+            newAnimeLoadResponse(title, url, TvType.Anime) {
+                posterUrl = media.coverImage.large; backgroundPosterUrl = media.bannerImage
+                this.plot = plot; tags = tagList; score = Score.from100(media.averageScore)
+                this.year = yearVal; this.duration = media.duration
+                this.actors = actorList; recommendations = recList
+                showStatus = if (media.status == "RELEASING") ShowStatus.Ongoing else ShowStatus.Completed
                 addEpisodes(DubStatus.Subbed, episodes)
             }
         }
@@ -621,55 +508,55 @@ class MiruroProvider : MainAPI() {
 
     // ══════════════════════════════════════════════════════════════════════════
     //  LOAD LINKS
-    //
-    //  Flow (mirrors api.py /watch/{provider}/{anilistId}/{category}/{slug}):
-    //    1. fetchAllProviderEpisodes() — one pipe call, returns episodes with
-    //       fully-injected slug IDs (e.g. "watch/kiwi/178005/sub/animepahe-1")
-    //    2. For each provider, find the episode matching epNum
-    //    3. fetchSources(ep.id, …) — ep.id IS the slug path; we base64-encode it
-    //    4. Resolve stream block (ssub > hsub > top-level), emit links
     // ══════════════════════════════════════════════════════════════════════════
-
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val anilistId = data.split("/")[4].toInt()
-        val epNum     = data.substringAfter("?ep=").toIntOrNull() ?: 1
+        val anilistId = extractAnilistId(data)
+        if (anilistId == null) {
+            toast("⛔ loadLinks: no anilistId in\n$data")
+            return false
+        }
+        val epNum = data.substringAfter("?ep=", "").toIntOrNull() ?: 1
+        Log.d(TAG, "loadLinks: anilistId=$anilistId epNum=$epNum")
+        toast("▶️ loadLinks ep#$epNum id=$anilistId")
 
-        // One pipe call for all providers — episodes already have slug IDs
         val allProviderEpisodes = fetchAllProviderEpisodes(anilistId)
+
+        if (allProviderEpisodes.isEmpty()) {
+            toast("⛔ No providers — episode fetch failed (CF block?)")
+            return false
+        }
 
         data class PendingStream(val linkName: String, val stream: StreamItem)
         data class PendingSubtitle(val lang: String, val url: String)
         data class ProviderResult(
-            val streams:   List<PendingStream>,
-            val subtitles: List<PendingSubtitle>,
-            val isSoft:    Boolean
+            val streams: List<PendingStream>, val subtitles: List<PendingSubtitle>, val isSoft: Boolean
         )
 
         val results: List<ProviderResult> = coroutineScope {
-            streamProviders.map { providerConfig ->
+            streamProviders.map { cfg ->
                 async {
                     try {
-                        val episodeList = allProviderEpisodes[providerConfig.id]
-                            ?: return@async ProviderResult(emptyList(), emptyList(), false)
+                        val episodeList = allProviderEpisodes[cfg.id]
+                        if (episodeList == null) {
+                            Log.d(TAG, "${cfg.id}: not in map")
+                            return@async ProviderResult(emptyList(), emptyList(), false)
+                        }
 
-                        // ep.id is already the full slug path after fetchAllProviderEpisodes
                         val ep = episodeList.firstOrNull { it.number == epNum }
-                            ?: return@async ProviderResult(emptyList(), emptyList(), false)
+                        if (ep == null) {
+                            val available = episodeList.map { it.number }
+                            Log.d(TAG, "${cfg.id}: ep#$epNum not found, have: $available")
+                            toast("⚠️ ${cfg.id}: ep#$epNum not found\nhave: $available")
+                            return@async ProviderResult(emptyList(), emptyList(), false)
+                        }
 
-                        // fetchSources base64-encodes ep.id (the slug path) — matches api.py
-                        val resp = fetchSources(
-                            episodeSlugId = ep.id,
-                            provider      = providerConfig.id,
-                            category      = providerConfig.category,
-                            anilistId     = anilistId
-                        )
+                        val resp = fetchSources(ep.id, cfg.id, cfg.category, anilistId)
 
-                        // Resolve which stream block to use (ssub > hsub > top-level)
                         val (rawStreams, rawSubtitles, isSoft) = when {
                             resp.ssub?.streams?.isNotEmpty() == true ->
                                 Triple(resp.ssub.streams, resp.ssub.subtitles, true)
@@ -677,113 +564,87 @@ class MiruroProvider : MainAPI() {
                                 Triple(resp.hsub.streams, resp.hsub.subtitles, false)
                             resp.streams?.isNotEmpty() == true ->
                                 Triple(resp.streams, resp.subtitles, false)
-                            else -> return@async ProviderResult(emptyList(), emptyList(), false)
+                            else -> {
+                                Log.d(TAG, "${cfg.id}: all stream blocks empty")
+                                return@async ProviderResult(emptyList(), emptyList(), false)
+                            }
                         }
 
-                        // Deduplicate subtitles by filename; English first
+                        // Deduplicate subtitles; English first
                         val seenFiles = mutableSetOf<String>()
                         val subtitles = mutableListOf<PendingSubtitle>()
                         rawSubtitles?.forEach { sub ->
                             if (!sub.file.isNullOrBlank()) {
-                                val filename = sub.file.substringAfterLast("/")
-                                if (seenFiles.add(filename)) {
+                                val fname = sub.file.substringAfterLast("/")
+                                if (seenFiles.add(fname))
                                     subtitles.add(PendingSubtitle(sub.label ?: sub.language ?: "Unknown", sub.file))
-                                }
                             }
                         }
-                        val engTrack = subtitles.firstOrNull {
+                        val eng = subtitles.firstOrNull {
                             it.lang.lowercase().contains("english") || it.lang.lowercase() == "en"
                         }
-                        val reordered = if (engTrack != null)
-                            listOf(engTrack) + subtitles.filter { it !== engTrack }
-                        else subtitles
+                        val reordered = if (eng != null) listOf(eng) + subtitles.filter { it !== eng } else subtitles
 
-                        // Provider-specific stream selection
-                        val toCollect: List<StreamItem> = when (providerConfig.id) {
+                        val toCollect: List<StreamItem> = when (cfg.id) {
                             "kiwi" -> {
-                                // isActive == true for HLS; for embed use != false to handle nulls
                                 val hls   = rawStreams.filter { it.type == "hls"   && it.isActive == true }
                                 val embed = rawStreams.filter { it.type == "embed" && it.isActive != false }
                                 hls + embed
                             }
-                            "bee", "hop", "dune" -> {
-                                rawStreams.filter { it.type == "hls" } +
-                                rawStreams.filter { it.type == "embed" }
-                            }
-                            "ally" -> {
-                                rawStreams.filter { it.type == "embed" }
-                                    .sortedBy { it.priority ?: Int.MAX_VALUE }
-                            }
+                            "bee", "hop", "dune" ->
+                                rawStreams.filter { it.type == "hls" } + rawStreams.filter { it.type == "embed" }
+                            "ally" ->
+                                rawStreams.filter { it.type == "embed" }.sortedBy { it.priority ?: Int.MAX_VALUE }
                             else -> emptyList()
                         }
 
                         if (toCollect.isEmpty()) return@async ProviderResult(emptyList(), reordered, isSoft)
 
-                        val pending = toCollect.map { stream ->
-                            val serverLabel = stream.fansub ?: stream.server ?: "Stream"
-                            val qualityTag  = stream.quality ?: ""
-                            val softTag     = if (isSoft) "[S]" else ""
-                            PendingStream(
-                                "${providerConfig.label} $serverLabel $qualityTag $softTag".trim(),
-                                stream
-                            )
-                        }
-
-                        ProviderResult(pending, reordered, isSoft)
+                        ProviderResult(
+                            toCollect.map { s ->
+                                val label = "${cfg.label} ${s.fansub ?: s.server ?: "Stream"} ${s.quality ?: ""} ${if (isSoft) "[S]" else ""}".trim()
+                                PendingStream(label, s)
+                            },
+                            reordered, isSoft
+                        )
                     } catch (ex: Exception) {
+                        Log.e(TAG, "${cfg.id} loadLinks exception: ${ex.message}", ex)
+                        if (ex !is ErrorLoadingException)
+                            toast("⛔ ${cfg.id} error\n${ex.message?.take(80)}")
                         ProviderResult(emptyList(), emptyList(), false)
                     }
                 }
             }.awaitAll()
         }
 
-        // Soft-subbed providers first
         val sorted = results.sortedByDescending { it.isSoft }
-
-        sorted.forEach { result ->
-            result.subtitles.forEach { sub ->
-                subtitleCallback(SubtitleFile(lang = sub.lang, url = sub.url))
-            }
-        }
-
-        sorted.forEach { result ->
-            result.streams.forEach { pending ->
-                if (pending.stream.type == "hls") {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name   = pending.linkName,
-                            url    = pending.stream.url,
-                            type   = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = pending.stream.referer ?: "$mainUrl/"
-                            this.quality = when (pending.stream.quality) {
-                                "1080p" -> Qualities.P1080.value
-                                "720p"  -> Qualities.P720.value
-                                "480p"  -> Qualities.P480.value
-                                "360p"  -> Qualities.P360.value
-                                else    -> Qualities.Unknown.value
-                            }
+        sorted.forEach { r -> r.subtitles.forEach { s -> subtitleCallback(SubtitleFile(s.lang, s.url)) } }
+        sorted.forEach { r ->
+            r.streams.forEach { p ->
+                if (p.stream.type == "hls") {
+                    callback(newExtractorLink(name, p.linkName, p.stream.url, ExtractorLinkType.M3U8) {
+                        this.referer = p.stream.referer ?: "$mainUrl/"
+                        this.quality = when (p.stream.quality) {
+                            "1080p" -> Qualities.P1080.value; "720p" -> Qualities.P720.value
+                            "480p"  -> Qualities.P480.value;  "360p" -> Qualities.P360.value
+                            else    -> Qualities.Unknown.value
                         }
-                    )
+                    })
                 } else {
-                    loadExtractor(
-                        url              = pending.stream.url,
-                        referer          = pending.stream.referer ?: "$mainUrl/",
-                        subtitleCallback = subtitleCallback,
-                        callback         = callback
-                    )
+                    loadExtractor(p.stream.url, p.stream.referer ?: "$mainUrl/", subtitleCallback, callback)
                 }
             }
         }
 
-        return sorted.any { it.streams.isNotEmpty() }
+        val found = sorted.any { it.streams.isNotEmpty() }
+        Log.d(TAG, "loadLinks done: found=$found")
+        if (!found) toast("⛔ No streams found from any provider")
+        return found
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     //  DATA CLASSES — AniList
     // ══════════════════════════════════════════════════════════════════════════
-
     data class AnilistTitle(val romaji: String?, val english: String?, val native: String? = null)
     data class AnilistCoverImage(val large: String?, val extraLarge: String? = null, val color: String? = null)
     data class AnilistStudioNode(val name: String?, val isAnimationStudio: Boolean? = null)
@@ -794,149 +655,87 @@ class MiruroProvider : MainAPI() {
     data class AnilistName(val full: String?, val native: String?)
     data class AnilistImage(val large: String?)
     data class AnilistTrailer(val id: String?, val site: String?, val thumbnail: String? = null)
-
     data class AnilistCharacterNode(val name: AnilistName?, val image: AnilistImage?)
     data class AnilistVoiceActor(val name: AnilistName?, val image: AnilistImage?)
-    data class AnilistCharacterEdge(
-        val role: String?,
-        val node: AnilistCharacterNode?,
-        val voiceActors: List<AnilistVoiceActor>?
-    )
+    data class AnilistCharacterEdge(val role: String?, val node: AnilistCharacterNode?, val voiceActors: List<AnilistVoiceActor>?)
     data class AnilistCharacters(val edges: List<AnilistCharacterEdge>?)
-
     data class AnilistRelatedMedia(
-        val id: Int,
-        val title: AnilistTitle,
-        val coverImage: AnilistCoverImage?,
-        val format: String?,
-        val type: String?   = null,
-        val status: String? = null
+        val id: Int, val title: AnilistTitle, val coverImage: AnilistCoverImage?,
+        val format: String?, val type: String? = null, val status: String? = null
     )
     data class AnilistRelationEdge(val relationType: String?, val node: AnilistRelatedMedia?)
     data class AnilistRelations(val edges: List<AnilistRelationEdge>?)
-
     data class AnilistRecommendationNode(val mediaRecommendation: AnilistRelatedMedia?)
     data class AnilistRecommendations(val nodes: List<AnilistRecommendationNode>?)
-
     data class AnilistMedia(
-        val id: Int,
-        val idMal: Int?             = null,
-        val title: AnilistTitle,
-        val description: String?    = null,
-        val coverImage: AnilistCoverImage,
-        val bannerImage: String?,
-        val format: String?,
-        val season: String?         = null,
-        val seasonYear: Int?        = null,
-        val episodes: Int?,
-        val duration: Int?          = null,
-        val status: String?,
-        val averageScore: Int?,
-        val meanScore: Int?         = null,
-        val popularity: Int?        = null,
-        val favourites: Int?        = null,
-        val trending: Int?          = null,
-        val genres: List<String>?,
-        val tags: List<AnilistTag>? = null,
-        val source: String?         = null,
-        val countryOfOrigin: String? = null,
-        val isAdult: Boolean?       = null,
-        val synonyms: List<String>? = null,
-        val siteUrl: String?        = null,
-        val trailer: AnilistTrailer? = null,
-        val studios: AnilistStudios?,
-        val nextAiringEpisode: AnilistNextAiring?,
-        val startDate: AnilistFuzzyDate?  = null,
-        val endDate: AnilistFuzzyDate?    = null,
-        val characters: AnilistCharacters? = null,
-        val relations: AnilistRelations?   = null,
-        val recommendations: AnilistRecommendations? = null
+        val id: Int, val idMal: Int? = null, val title: AnilistTitle,
+        val description: String? = null, val coverImage: AnilistCoverImage,
+        val bannerImage: String?, val format: String?, val season: String? = null,
+        val seasonYear: Int? = null, val episodes: Int?, val duration: Int? = null,
+        val status: String?, val averageScore: Int?, val meanScore: Int? = null,
+        val popularity: Int? = null, val favourites: Int? = null, val trending: Int? = null,
+        val genres: List<String>?, val tags: List<AnilistTag>? = null, val source: String? = null,
+        val countryOfOrigin: String? = null, val isAdult: Boolean? = null,
+        val synonyms: List<String>? = null, val siteUrl: String? = null,
+        val trailer: AnilistTrailer? = null, val studios: AnilistStudios?,
+        val nextAiringEpisode: AnilistNextAiring?, val startDate: AnilistFuzzyDate? = null,
+        val endDate: AnilistFuzzyDate? = null, val characters: AnilistCharacters? = null,
+        val relations: AnilistRelations? = null, val recommendations: AnilistRecommendations? = null
     )
-
     data class AnilistPage(val media: List<AnilistMedia>)
     data class AnilistCollectionData(@JsonProperty("Page") val page: AnilistPage)
     data class AnilistCollectionResponse(val data: AnilistCollectionData)
-
     data class AnilistAiringScheduleItem(
-        val episode: Int?        = null,
-        val airingAt: Long?      = null,
-        val timeUntilAiring: Long? = null,
-        val media: AnilistMedia
+        val episode: Int? = null, val airingAt: Long? = null,
+        val timeUntilAiring: Long? = null, val media: AnilistMedia
     )
     data class AnilistSchedulePage(val airingSchedules: List<AnilistAiringScheduleItem>)
     data class AnilistScheduleData(@JsonProperty("Page") val page: AnilistSchedulePage)
     data class AnilistScheduleResponse(val data: AnilistScheduleData)
-
     data class AnilistLoadData(@JsonProperty("Media") val media: AnilistMedia)
     data class AnilistLoadResponse(val data: AnilistLoadData)
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  DATA CLASSES — Miruro pipe (episodes / sources)
+    //  DATA CLASSES — Miruro pipe
     // ══════════════════════════════════════════════════════════════════════════
-
     data class PipeEpisodesResponse(val providers: ProvidersData?, val mappings: MappingsData? = null)
-    data class MappingsData(
-        val anilistId: Int? = null,
-        val malId: Int?     = null,
-        val kitsuId: Int?   = null
-    )
+    data class MappingsData(val anilistId: Int? = null, val malId: Int? = null, val kitsuId: Int? = null)
     data class ProvidersData(
-        val kiwi: ProviderData?,
-        val ally: ProviderData?,
-        val bee:  ProviderData?,
-        val hop:  ProviderData?,
-        val dune: ProviderData?
+        @JsonProperty("kiwi") val kiwi: ProviderData?,
+        @JsonProperty("ally") val ally: ProviderData?,
+        @JsonProperty("bee")  val bee:  ProviderData?,
+        @JsonProperty("hop")  val hop:  ProviderData?,
+        @JsonProperty("dune") val dune: ProviderData?
     )
     data class ProviderData(val episodes: EpisodesData?)
-    data class EpisodesData(val sub: List<EpisodeItem>?, val dub: List<EpisodeItem>?)
-    data class EpisodeItem(
-        val id: String,
-        val number: Int,
-        val title: String?,
-        val description: String?,
-        val image: String?,
-        val airDate: String?,
-        val duration: Int?,
-        val filler: Boolean?
+    data class EpisodesData(
+        @JsonProperty("sub") val sub: List<EpisodeItem>?,
+        @JsonProperty("dub") val dub: List<EpisodeItem>?
     )
-
+    data class EpisodeItem(
+        val id: String, val number: Int, val title: String?,
+        val description: String?, val image: String?,
+        val airDate: String?, val duration: Int?, val filler: Boolean?
+    )
     data class SourcesResponse(
-        val streams:   List<StreamItem>?,
-        val subtitles: List<SubtitleItem>?,
-        val download:  String?,
-        val ssub:      SsubBlock?,
-        val hsub:      SsubBlock?
+        val streams: List<StreamItem>?, val subtitles: List<SubtitleItem>?,
+        val download: String?, val ssub: SsubBlock?, val hsub: SsubBlock?
     )
     data class SsubBlock(
-        val streams:   List<StreamItem>?,
-        val subtitles: List<SubtitleItem>?,
-        val provider:  String?,
-        val thumbnail: String?
+        val streams: List<StreamItem>?, val subtitles: List<SubtitleItem>?,
+        val provider: String?, val thumbnail: String?
     )
     data class StreamItem(
-        val url:      String,
-        val type:     String?,
-        val quality:  String?,
-        val audio:    String?,
-        val fansub:   String?,
-        val isActive: Boolean?,
-        val server:   String?,
-        val priority: Int?,
-        @JsonProperty("default")
-        val isDefault: Boolean?,
-        val referer:  String?,
-        val codec:    String?,
-        val resolution: ResolutionItem?
+        val url: String, val type: String?, val quality: String?,
+        val audio: String?, val fansub: String?, val isActive: Boolean?,
+        val server: String?, val priority: Int?,
+        @JsonProperty("default") val isDefault: Boolean?,
+        val referer: String?, val codec: String?, val resolution: ResolutionItem?
     )
     data class ResolutionItem(val width: Int?, val height: Int?)
     data class SubtitleItem(
-        val file:     String?,
-        val label:    String?,
-        val kind:     String?,
-        @JsonProperty("default")
-        val isDefault: Boolean?,
-        val language: String?,
-        val format:   String?,
-        val encoding: String?
+        val file: String?, val label: String?, val kind: String?,
+        @JsonProperty("default") val isDefault: Boolean?,
+        val language: String?, val format: String?, val encoding: String?
     )
 }
